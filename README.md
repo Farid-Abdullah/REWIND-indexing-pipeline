@@ -81,3 +81,42 @@ tile. Distance = how many bits differ (*Hamming distance*).
 | `ignore_polygons` | `SCAN_PARAMS` | regions to ignore (e.g. sky) |
 
 Note: "inactive" means *no significant motion*, not *no people*. People standing still blend into MOG2's background after ~100 s.
+
+## Syncing with a shared VM (proposal, not set up yet)
+
+**Problem:** a copy of this repo runs on a shared VM. Everyone logs in with the same username, so putting
+anyone's GitHub credentials there (a token, an SSH key, or SSH agent forwarding) would let every user of that
+account push as that person.
+
+**Idea:** a laptop that already has GitHub access is the go-between. It treats the VM as a second git remote
+over plain SSH. No GitHub credentials ever go on the VM.
+
+```
+GitHub  ⇄  laptop  ⇄  VM
+```
+
+One-time setup (replace `<user>`, `<vm-host>` and `<path>`):
+
+```bash
+# on the VM, inside the repo
+git -c user.name="Your Name" -c user.email="you@example.com" commit -am "VM changes"  # commit VM work without changing the shared git identity
+git config receive.denyCurrentBranch updateInstead   # let pushes update the VM's checked-out files (this repo only)
+
+# on the laptop
+git remote add vm ssh://<user>@<vm-host>/<path>
+# optional: copy the laptop's *public* key to the VM's ~/.ssh/authorized_keys to skip password prompts
+```
+
+Each sync, from the laptop:
+
+```bash
+git fetch vm && git merge vm/main   # VM -> laptop
+git push origin main                # laptop -> GitHub
+git push vm main                    # laptop -> VM
+```
+
+- `git push vm` is refused while the VM has uncommitted edits, so it can't overwrite someone's work in progress.
+  Commit or stash on the VM first.
+- `video/` and `outputs/` are git-ignored, so videos and results don't sync. Copy them with `scp` or `rsync`
+  if needed.
+- Any teammate can be the go-between. They just add the `vm` remote on their own machine.
