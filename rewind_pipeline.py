@@ -46,7 +46,12 @@ Every sampler picks from the SAME candidate pool so the comparison is fair,
 and each is scored with coverage / redundancy / event-recall / track-recall.
 
 Dependencies:  opencv-python numpy pandas matplotlib
-Deep methods:  torch transformers ultralytics   (each missing one is skipped)
+Deep methods:  torch transformers ultralytics lap sentencepiece protobuf   (each missing one is skipped)
+               SigLIP's tokenizer needs sentencepiece: without it SigLIP, the embeddings and
+               the novelty / kcenter / importance samplers are all skipped.
+
+The notebook pipeline.ipynb imports this file for the deep gate and stages 2-3 and uses
+motion_gating.py / keyframes.py for stage 1 and the CPU keyframes.
 """
 from __future__ import annotations
 
@@ -1360,6 +1365,27 @@ def export_keyframes(video, info, meta, keep, out_dir, name, camera_id):
     return files
 
 
+def write_index_records(out, meta, keep, E, events, track_sum, camera_id, video_name, t_start=None):
+    """Hand-off to captioning / indexing: out/index_records.jsonl (one record per keyframe) and
+    out/index_embeddings.npy (row `embedding_row` of a record = its SigLIP embedding)."""
+    out = Path(out)
+    np.save(out / "index_embeddings.npy", E[keep].astype(np.float16) if E.shape[1] else E[:0])
+    with open(out / "index_records.jsonl", "w") as f:
+        for row_i, (ci, r) in enumerate(meta.loc[keep].iterrows()):
+            act = events[(events.start_s <= r.timestamp_s) & (events.end_s >= r.timestamp_s)] if len(events) else events
+            objs = track_sum[(track_sum.start_s <= r.timestamp_s) & (track_sum.end_s >= r.timestamp_s)] \
+                if len(track_sum) else track_sum
+            rec = {"camera_id": camera_id, "video": video_name, "frame_idx": int(r.frame_idx),
+                   "timestamp_s": round(float(r.timestamp_s), 3), "segment_id": int(r.segment_id),
+                   "wallclock": (t_start + timedelta(seconds=float(r.timestamp_s))).isoformat() if t_start else None,
+                   "importance": round(float(r.get("importance", 0.0)), 3), "embedding_row": row_i,
+                   "events": sorted(set(act.key)) if len(act) else [],
+                   "objects": objs.cls.value_counts().to_dict() if len(objs) else {},
+                   "siglip_tag": r.get("siglip_tag", "")}
+            f.write(json.dumps(rec) + "\n")
+    return out / "index_records.jsonl"
+
+
 def plot_timeline(path, scores, gate_results, primary, events, keeps, info):
     try:
         import matplotlib
@@ -1503,21 +1529,7 @@ def run(video, cfg, out_root="outputs", camera_id=None, start_time=None, gt_csv=
         kf.drop(columns="phash").to_csv(out / f"keyframes_{name}.csv")
     # index records for the primary sampler: the hand-off to captioning / indexing
     psamp = c["primary"] if c["primary"] in keeps else next(iter(keeps))
-    keep = keeps[psamp]
-    np.save(out / "index_embeddings.npy", E[keep].astype(np.float16) if E.shape[1] else E[:0])
-    with open(out / "index_records.jsonl", "w") as f:
-        for row_i, (ci, r) in enumerate(meta.loc[keep].iterrows()):
-            act = events[(events.start_s <= r.timestamp_s) & (events.end_s >= r.timestamp_s)] if len(events) else events
-            objs = track_sum[(track_sum.start_s <= r.timestamp_s) & (track_sum.end_s >= r.timestamp_s)] \
-                if len(track_sum) else track_sum
-            rec = {"camera_id": camera_id, "video": video.name, "frame_idx": int(r.frame_idx),
-                   "timestamp_s": round(float(r.timestamp_s), 3), "segment_id": int(r.segment_id),
-                   "wallclock": (t_start + timedelta(seconds=float(r.timestamp_s))).isoformat() if t_start else None,
-                   "importance": round(float(r.importance), 3), "embedding_row": row_i,
-                   "events": sorted(set(act.key)) if len(act) else [],
-                   "objects": objs.cls.value_counts().to_dict() if len(objs) else {},
-                   "siglip_tag": r.get("siglip_tag", "")}
-            f.write(json.dumps(rec) + "\n")
+    write_index_records(out, meta, keeps[psamp], E, events, track_sum, camera_id, video.name, t_start)
     summary["stage3"] = {"primary": psamp, "comparison": evals}
 
     if gt_csv:

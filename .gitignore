@@ -10,3 +10,6 @@ outputs/
 
 __pycache__/
 .ipynb_checkpoints/
+
+# model weights downloaded by ultralytics into the working folder
+*.pt

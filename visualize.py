@@ -105,26 +105,27 @@ def contact_sheet(video_path, fps, times_s, width=200, cols=6) -> np.ndarray:
 # Plots
 # ---------------------------------------------------------------------------------------------------
 def plot_timeline(ax, scores: pd.DataFrame, score_col, segments, start_threshold, stop_threshold,
-                  smooth_window=1, keyframes=None, title=""):
+                  smooth_window=1, keyframes=None, title="", scale=100.0, ylabel="moving pixels (%)"):
     """Motion score over time (x in minutes, y in % of pixels), thresholds as horizontal lines,
     segments shaded, keyframes as coloured ticks under the axis."""
     t = scores["timestamp_s"].to_numpy() / 60
-    y = scores[score_col].to_numpy() * 100
+    y = scores[score_col].to_numpy() * scale  # scale=1 for scores that are not fractions (fused ratio)
     ax.plot(t, y, lw=0.4, color="#9ecae1", label="raw score")
     if smooth_window > 1:
         ax.plot(t, smooth(y, smooth_window), lw=0.8, color="#08519c", label="smoothed")
     for seg in segments.itertuples(index=False):
         ax.axvspan(seg.start_s / 60, seg.end_s / 60, color="#fdae6b", alpha=0.35, lw=0)
-    ax.axhline(start_threshold * 100, color="#d62728", lw=0.9, ls="--", label=f"start {start_threshold * 100:.2f}%")
-    ax.axhline(stop_threshold * 100, color="#ff7f0e", lw=0.9, ls=":", label=f"stop {stop_threshold * 100:.2f}%")
-    top = max(np.percentile(y, 99.8) * 1.15, start_threshold * 200)
+    unit = "%" if scale == 100 else ""
+    ax.axhline(start_threshold * scale, color="#d62728", lw=0.9, ls="--", label=f"start {start_threshold * scale:.2f}{unit}")
+    ax.axhline(stop_threshold * scale, color="#ff7f0e", lw=0.9, ls=":", label=f"stop {stop_threshold * scale:.2f}{unit}")
+    top = max(np.percentile(y, 99.8) * 1.15, start_threshold * scale * 2)
     if keyframes is not None and len(keyframes):
         for reason, g in keyframes.groupby("reason"):
             ax.scatter(g["timestamp_s"] / 60, np.full(len(g), -0.06 * top), marker="|", s=60,
                        color=REASON_COLORS.get(reason, "k"), label=f"kf: {reason} ({len(g)})", clip_on=False)
     ax.set_ylim(-0.1 * top, top)
     ax.set_xlim(t.min(), t.max())
-    ax.set_ylabel("moving pixels (%)")
+    ax.set_ylabel(ylabel)
     ax.set_xlabel("video time (min)")
     ax.set_title(title, loc="left", fontsize=10)
     ax.grid(alpha=0.25, lw=0.5)
