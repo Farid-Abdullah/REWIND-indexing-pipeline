@@ -4,44 +4,49 @@
 Expensive models (captioning, the search index) then only look at those frames instead of every frame.
 On the 30-min MEVA test video the v1 settings kept 109 keyframes instead of 1,801 (1 per second), 16.5× fewer.
 
-## Run it
+## Run it (branch `moreVids`: many videos)
+
+**On the VM, the first time.** Clone the branch into a new folder, so nothing in the old checkout (its notebook,
+outputs, caches) is touched. The repo is public, so no GitHub login is needed on the VM:
+
+```bash
+cd /mnt/5T_storage
+git clone -b moreVids https://github.com/Farid-Abdullah/cctv-motion-gating rewind-batch
+cd rewind-batch
+```
+
+Then in VS Code open `rewind-batch/pipeline.ipynb`, pick the kernel **rewind (5T)**, check the config cell, *Run All*.
+It prints one line per video. When it's done, open **`explore.ipynb`** and *Run All* to see the results.
+
+Or from a terminal inside `tmux` (keeps running if the laptop disconnects):
+
+```bash
+tmux new -s batch            # later: tmux attach -t batch
+conda activate <the env behind "rewind (5T)">
+python datasets.py           # what's on disk: videos, hours, annotations (quick)
+python batch.py              # both phases;  --stages cpu  = only stages 1-2
+```
+
+- **Which videos:** `selection.csv`, made on the first run: ~1 h of MEVA (whole 5-min time slots of all 4 cameras,
+  annotated slots first) + ~1 h of UCA `dev_videos` (spread over categories, test split first). Edit it to change
+  the set, or delete it to pick again. Data paths: `DATA_ROOT` in the config cell
+  (`/mnt/5T_storage/clipsExtraction/datasets`).
+- **Two phases:** stages 1-2 (CPU) for every video first, then stages 3-4 (GPU) for every video. If the GPU phase
+  breaks or takes too long, interrupt it: the CPU results are already saved and `explore.ipynb` works with them.
+- **Resume:** finished videos are skipped on a re-run (`FORCE = True` redoes them). A failing video is logged and
+  skipped; its traceback is in `outputs/batch/<dataset>/<video>/error_cpu.json` (or `error_gpu.json`).
+- **Ground truth** comes from the datasets themselves (`datasets.py`): MEVA activity labels (`*.activities.yml`,
+  frame numbers / fps) and UCA sentences with timestamps. No hand-made CSV needed.
+
+**Single video / command line:** `python motion_gating.py video/x.mp4` then `python keyframes.py video/x.mp4`.
+
+**Environment** (if you need a new one):
 
 ```bash
 conda env create -f environment.yml          # once (on the VM: add -p /mnt/5T_storage/envs/motion-gating)
 conda activate motion-gating
 python -m ipykernel install --user --name motion-gating   # once, makes the env available in Jupyter
-python meva_30min.py                          # optional: download a 30-min test video into video/
 ```
-
-Open **`pipeline.ipynb`** (kernel **motion-gating**), set `VIDEO` in the config cell, *Run All*.
-Results go to `outputs/<video name>/`. The two CPU stages also run from the command line:
-`python motion_gating.py video/x.mp4` then `python keyframes.py video/x.mp4`.
-
-**GPU stages** (deep gate, events, frame selection for the index) need extra packages:
-
-```bash
-export PIP_CACHE_DIR=/mnt/5T_storage/pip_cache TMPDIR=/mnt/5T_storage/tmp   # on the VM: keep pip off the root disk
-pip install torch transformers ultralytics lap sentencepiece protobuf
-python -c "import cv2, torch; print(cv2.__version__, torch.cuda.is_available())"
-```
-
-`ultralytics` installs `opencv-python` next to our `opencv-python-headless`. If `import cv2` breaks afterwards:
-`pip uninstall -y opencv-python opencv-python-headless && pip install opencv-python-headless`.
-Any model that fails to load is skipped with a warning, so the notebook still runs without a GPU, with fewer sections.
-`"mock_models": True` in the config cell runs everything with fake models: a quick plumbing check, numbers meaningless.
-
-## Files
-
-| File | What it does |
-|---|---|
-| `pipeline.ipynb` | **The demo.** Runs every stage on one video and shows timelines, examples, checks and comparisons |
-| `motion_gating.py` | **Stage 1.** Scores how much moves in each frame, finds the time ranges ("segments") with motion. Also the ground-truth checks |
-| `keyframes.py` | **Stage 2.** Picks a few representative frames per segment and saves them as JPGs |
-| `gpu_stages.py` | Deep-model parts (from Muzayyan's v2 pipeline): DINOv2 motion gate, **stage 3** events (YOLO-World + ByteTrack, SigLIP, X-CLIP), **stage 4** frame selection and the `index_records.jsonl` hand-off |
-| `video_utils.py`, `visualize.py` | Reading frames; thumbnails, plots and GIFs for the notebook |
-| `meva_30min.py` | Downloads six 5-min clips from the public MEVA dataset and joins them into `video/meva_30min.mp4` |
-| `environment.yml` | The conda environment (CPU part) |
-| `docs/pipeline.md` | How every step works, why, its weak spots, results so far, and the papers behind it (report material) |
 
 ## Stage 1: motion gating (`motion_gating.py`)
 
@@ -63,7 +68,7 @@ Any model that fails to load is skipped with a warning, so the notebook still ru
 8. **Segments.** *Hysteresis*: start above a high threshold, stop below a lower one, so it doesn't flicker on and off.
    Then merge gaps under 3 s, drop pieces under 1 s, and add 2 s padding on each side.
 
-**Optional gates** (`pipeline.ipynb`): the *deep gate* (`gpu_stages.scan_deep`) compares DINOv2 features of 14×14-pixel patches
+**Optional gates** (config cell of `pipeline.ipynb`): the *deep gate* (`gpu_stages.scan_deep`) compares DINOv2 features of 14×14-pixel patches
 with a slowly learned background, 2 frames/s, GPU. The *fused gate* divides each gate's score by its own threshold and
 averages the two highest: a soft "two gates agree" vote. On the café ground truth MOG2 and fused were nearly tied, so
 MOG2 stays the default (`GATE` in the config).
@@ -101,15 +106,19 @@ Known weak spots (café video): track IDs switch in crowds, so one person can "a
 `loitering` fire almost constantly in a busy lobby; X-CLIP rarely passes its threshold. The rules were written for
 outdoor CCTV and need tuning per scene.
 
-## Outputs (`outputs/<video name>/`)
+## Outputs (`outputs/batch/<dataset>/<video name>/`)
+
+Batch-level files in `outputs/batch/`: `batch_summary.csv` (one row per video, every number below), `selection_used.csv`,
+`batch_config.json`. Per video, `summary_cpu.json` / `summary_gpu.json` hold that video's row, and `gt.csv` the
+labelled items with a `has_keyframe` column.
+
 
 | File | Contents |
 |---|---|
 | `segments.csv` | one row per segment: start, end, duration, peak motion |
 | `keyframes/` + `keyframes.csv` | the JPGs (`kf_00-12-34.500_seg007.jpg`) and one row each: time, segment, reason |
 | `motion_scores.csv` | every gate's score for every analysed frame |
-| `gt_eval_gates.csv`, `gt_eval_keyframes.csv` | ground-truth results (only if `GT_CSV` is set) |
-| `gifs/` | animated previews of the strongest segments |
+| `gt.csv`, `gt_eval_gates.csv`, `gt_eval_keyframes.csv` | ground truth and how each gate / keyframe set did on it, incl. **uniform sampling with the same number of frames** and 1 frame/s as baselines (only for videos with annotations) |
 | `cache/` | the slow decode pass (and the deep gate), so re-runs are fast. Safe to delete |
 | `events/` | stages 3-4 (GPU): `events.csv` (merged events), `tracks.csv` + `tracks_raw.csv`, `xclip_windows.csv`, `candidate_frames.csv`, `sampling_comparison.csv`, `keyframes_<sampler>.csv` (+ JPGs in `keyframes/kcenter/`), `gifs/`, `timeline.png`, and the hand-off **`index_records.jsonl` + `index_embeddings.npy`** |
 

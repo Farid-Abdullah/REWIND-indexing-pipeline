@@ -20,13 +20,15 @@ well-chosen frames to expensive models (captioning, indexing) instead of every f
 ## Commands
 
 ```bash
-python meva_30min.py        # download the test video -> video/meva_30min.mp4 (6 x 5-min MEVA clips joined)
-python motion_gating.py     # stage 1: motion scores + segments (default video: video/meva_30min.mp4)
-python keyframes.py         # stage 2: keyframes per segment
-# or open pipeline.ipynb (kernel motion-gating) and Run All: every stage (GPU stages skip cleanly without models)
+python datasets.py          # list MEVA / UCA videos, hours and annotations under DATA_ROOT
+python batch.py             # every stage on every video in selection.csv -> outputs/batch/ (= pipeline.ipynb)
+python motion_gating.py v.mp4 && python keyframes.py v.mp4   # stages 1-2 on one video
+# notebooks: pipeline.ipynb runs the batch (no pictures), explore.ipynb shows the results; kernel "rewind (5T)" on the VM
 ```
 
-There are no tests. Check a change by re-running the notebook and comparing the numbers. The old baseline on
+There are no tests. Check a change by re-running the batch and comparing `outputs/batch/batch_summary.csv`.
+For a plumbing check without the VM's data, `REWIND_DATA_ROOT`, `REWIND_OUT_ROOT`, `REWIND_SELECTION` and
+`REWIND_MOCK=1` point the notebooks at a fake dataset tree and fake GPU models. The old baseline on
 `meva_30min.mp4` was 109 keyframes instead of 1,801 at 1 fps (16.5x fewer), measured *before* `q_noise=0.5` and
 `mog2_color=True` became defaults; re-measure it. For a CPU plumbing check of the whole notebook, set
 `"mock_models": True` in its config cell.
@@ -35,16 +37,18 @@ There are no tests. Check a change by re-running the notebook and comparing the 
 
 | Path | Role |
 |---|---|
-| `pipeline.ipynb` | The demo notebook: every stage on one video. Committed **without** outputs |
+| `pipeline.ipynb` | Runs the batch (`batch.run_batch`) over `selection.csv`; prints only. Committed **without** outputs |
+| `explore.ipynb` | Reads `outputs/batch/` and shows everything (overview, per video, MEVA multi-camera, GT misses). Committed **without** outputs |
+| `batch.py` | Two-phase batch (CPU stages for all videos, then GPU stages), resume, per-video error files, `batch_summary.csv` |
+| `datasets.py` | MEVA / UCA discovery, ~1 h selection per dataset, ground truth (MEVA `*.activities.yml` frames / fps; UCA sentences) |
 | `motion_gating.py` | Stage 1: frame diff + MOG2 (colour, NCC lighting filter), adaptive threshold on the quieter half, hysteresis segments, fused gate (`add_fused`); ground-truth checks (`gate_table`, `keyframe_hits`, `gate_agreement`) |
 | `keyframes.py` | Stage 2: first / peak / change (4x4 tile pHash) / maxgap keyframes, dedup, idle heartbeat |
 | `gpu_stages.py` | From Muzayyan's v2 (LLM-written): `Models` (lazy, skip on failure), DINOv2 gate (`scan_deep`), stage 3 events, stage 4 samplers, `write_index_records` |
 | `video_utils.py`, `visualize.py` | Frame reading; plots, GIFs, tracker-box drawing |
-| `meva_30min.py` | Downloads the 30-min MEVA test video |
 | `docs/pipeline.md` | Method write-up with references; keep it in sync when a step or default changes |
-| `video/`, `outputs/` | Git-ignored. Videos and results stay local |
+| `video/`, `outputs/` | Git-ignored. Videos and results stay local. Datasets live outside the repo (`datasets.DATA_ROOT`) |
 
-The slow decode pass is cached in `outputs/<video>/cache/scan_<hash>.npz`. Changing a scan parameter
+The slow decode pass is cached in `outputs/batch/<dataset>/<video>/cache/scan_<hash>.npz`. Changing a scan parameter
 invalidates it; changing a segment or keyframe parameter does not.
 
 ## `gpu_stages.py` and the v1/v2 merge

@@ -345,6 +345,26 @@ With a ground-truth CSV (`start_s,end_s[,label]`, one row per event), the notebo
 UCA's timestamped sentences can also serve as ground truth for stage 1 and 2 ("did every annotated event get a
 segment and a keyframe?"), which replaces hand-made files of unknown origin.
 
+### 5.2a Ground truth in the batch run (`datasets.py`, `batch.py`)
+
+The batch (`pipeline.ipynb` / `batch.py`) runs on ~1 h of MEVA and ~1 h of UCA and scores every video that has labels:
+
+- **MEVA** `*.activities.yml` (KPF format): one activity per line with a frame range `tsr0: [start, end]`; seconds =
+  frame / fps. Only ~37 activity types are labelled (carrying, opening a trunk, talking...), so unlabelled motion is
+  not an error. Useful as "these moments must not be missed" (event recall, keyframe hits), not for precision.
+  Only part of MEVA is annotated; `datasets.py` matches annotation files to videos by name (without the `.r13`
+  release suffix, ±5 s on the start time).
+- **UCA** sentences cover each video back to back, quiet parts included, so frame precision/recall against them
+  mean little. The useful number is the share of sentences whose time span contains at least one keyframe: a span
+  without one can never be found by a search over keyframes.
+- **Baselines** in every `gt_eval_keyframes.csv`: the same number of frames spread **uniformly** over the video, and
+  1 frame/s. Gating only earns its place if it beats uniform sampling at the same budget.
+
+Known caveats: each 5-min MEVA clip is processed on its own, so MOG2 re-learns the background at the start of every
+clip (`mog2_history=500` samples = 100 s); joining clips per camera would avoid that. UCF-Crime is partly not CCTV
+(news/YouTube compilations with cuts and replays); a cut looks like whole-frame motion, so those videos come out
+mostly "active".
+
 ### 5.3 What the supervisor asked for (not built yet)
 
 Retrieval Recall@1/5/10 at temporal IoU 0.3 and 0.5 on UCA test queries, against CLIP-only and SigLIP-only
@@ -392,7 +412,7 @@ typical one ("hours of nothing"). Both should stay in the development set, and t
 4. Should stage 1 favour recall even more (lower `k`), given that misses are fatal and later stages filter?
 5. Track rules: tune per scene, or replace with SigLIP/VLM-based checks?
 6. Replace X-CLIP's softmax threshold with a margin over the background prompt (like SigLIP), or drop X-CLIP?
-7. Use UCA annotations as ground truth for stages 1-2 (section 5.2).
+7. ~~Use UCA annotations as ground truth for stages 1-2~~: done in the batch run (section 5.2a), with MEVA activities too.
 
 ---
 
