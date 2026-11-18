@@ -1,54 +1,46 @@
-# Motion gating and keyframe extraction
+# REWIND ingest: motion gating, keyframes, events
 
-**Goal:** in a long video from a fixed camera, find *when something moves* and pick *a few frames that show it*.
-An expensive model (e.g. one that describes images) then only looks at those frames instead of all 54,000.
-On the 30-min test video: **109 keyframes instead of 1,801** (1 per second), so 16.5× fewer.
+**Goal:** in a long video from a fixed camera, find *when something happens* and pick *a few frames that show it*.
+Expensive models (captioning, the search index) then only look at those frames instead of every frame.
+On the 30-min MEVA test video the v1 settings kept 109 keyframes instead of 1,801 (1 per second), 16.5× fewer.
 
 ## Run it
 
 ```bash
-conda env create -f environment.yml          # once
+conda env create -f environment.yml          # once (on the VM: add -p /mnt/5T_storage/envs/motion-gating)
 conda activate motion-gating
-python -m ipykernel install --user --name motion-gating   # once, makes the env available in Jupyter(vscode prompts you for env automatically)
-
-python meva_30min.py        # download the test video into video/ (skip if you already have it)
-python motion_gating.py     # stage 1  (or: python motion_gating.py video/other.mp4, meva_30min.mp4 is defualt)
-python keyframes.py         # stage 2
+python -m ipykernel install --user --name motion-gating   # once, makes the env available in Jupyter
+python meva_30min.py                          # optional: download a 30-min test video into video/
 ```
 
-Or open **`pipeline.ipynb`** (kernel **motion-gating**) and *Run All*: it runs every stage and shows the results.
-Results go to `outputs/<video name>/` (stages 3-4 in `outputs/<video name>/events/`).
-`explore.ipynb` is the older v1-only notebook, kept for its MEVA results.
+Open **`pipeline.ipynb`** (kernel **motion-gating**), set `VIDEO` in the config cell, *Run All*.
+Results go to `outputs/<video name>/`. The two CPU stages also run from the command line:
+`python motion_gating.py video/x.mp4` then `python keyframes.py video/x.mp4`.
 
-### GPU stages (deep gate, events, samplers)
-
-`pipeline.ipynb` also runs the parts merged in from the v2 pipeline (`rewind_pipeline.py`). They need extra
-packages and, realistically, a GPU:
+**GPU stages** (deep gate, events, frame selection for the index) need extra packages:
 
 ```bash
 export PIP_CACHE_DIR=/mnt/5T_storage/pip_cache TMPDIR=/mnt/5T_storage/tmp   # on the VM: keep pip off the root disk
-pip install -r requirements-gpu.txt
+pip install torch transformers ultralytics lap sentencepiece protobuf
+python -c "import cv2, torch; print(cv2.__version__, torch.cuda.is_available())"
 ```
 
-Any model that fails to load is skipped with a warning, so the notebook still runs on a laptop, with fewer sections.
-Set `"mock_models": True` in the config cell for a quick CPU test with fake models (numbers meaningless).
+`ultralytics` installs `opencv-python` next to our `opencv-python-headless`. If `import cv2` breaks afterwards:
+`pip uninstall -y opencv-python opencv-python-headless && pip install opencv-python-headless`.
+Any model that fails to load is skipped with a warning, so the notebook still runs without a GPU, with fewer sections.
+`"mock_models": True` in the config cell runs everything with fake models: a quick plumbing check, numbers meaningless.
 
 ## Files
 
 | File | What it does |
 |---|---|
-| `meva_30min.py` | Downloads six 5-min clips from the public MEVA dataset and joins them into `video/meva_30min.mp4` |
-| `motion_gating.py` | **Stage 1.** Scores how much moves in each frame and finds the time ranges ("segments") with motion |
+| `pipeline.ipynb` | **The demo.** Runs every stage on one video and shows timelines, examples, checks and comparisons |
+| `motion_gating.py` | **Stage 1.** Scores how much moves in each frame, finds the time ranges ("segments") with motion. Also the ground-truth checks |
 | `keyframes.py` | **Stage 2.** Picks a few representative frames per segment and saves them as JPGs |
-| `video_utils.py` | Reads frames from a video (used by both stages) |
-| `visualize.py` | Thumbnails, plots and GIFs for the notebook |
-| `pipeline.ipynb` | **Main notebook.** Every stage, timelines, examples, checks, gate and sampler comparisons |
-| `deep_gate.py` | Optional third gate: DINOv2 patch features (adds `score_deep`) |
-| `evaluate.py` | Gates and keyframes vs ground truth (CSV `start_s,end_s[,label]`), gate agreement |
-| `rewind_pipeline.py` | v2 pipeline (Muzayyan): models, events (YOLO-World + ByteTrack, SigLIP, X-CLIP), samplers, `index_records.jsonl`. Also runs alone: `python rewind_pipeline.py video.mp4 --out outputs_v2` |
-| `visualize_events.py` | Drawing helpers for the GPU stages |
-| `requirements-gpu.txt` | Extra packages for the GPU stages |
-| `explore.ipynb` | Older v1-only notebook (MEVA results) |
+| `gpu_stages.py` | Deep-model parts (from Muzayyan's v2 pipeline): DINOv2 motion gate, **stage 3** events (YOLO-World + ByteTrack, SigLIP, X-CLIP), **stage 4** frame selection and the `index_records.jsonl` hand-off |
+| `video_utils.py`, `visualize.py` | Reading frames; thumbnails, plots and GIFs for the notebook |
+| `meva_30min.py` | Downloads six 5-min clips from the public MEVA dataset and joins them into `video/meva_30min.mp4` |
+| `environment.yml` | The conda environment (CPU part) |
 
 ## Stage 1: motion gating (`motion_gating.py`)
 
@@ -69,7 +61,7 @@ Set `"mock_models": True` in the config cell for a quick CPU test with fake mode
 8. **Segments.** *Hysteresis*: start above a high threshold, stop below a lower one, so it doesn't flicker on and off.
    Then merge gaps under 3 s, drop pieces under 1 s, and add 2 s padding on each side.
 
-**Optional gates** (`pipeline.ipynb`): the *deep gate* (`deep_gate.py`) compares DINOv2 features of 14×14-pixel patches
+**Optional gates** (`pipeline.ipynb`): the *deep gate* (`gpu_stages.scan_deep`) compares DINOv2 features of 14×14-pixel patches
 with a slowly learned background, 2 frames/s, GPU. The *fused gate* divides each gate's score by its own threshold and
 averages the two highest: a soft "two gates agree" vote. On the café ground truth MOG2 and fused were nearly tied, so
 MOG2 stays the default (`GATE` in the config).
@@ -90,6 +82,23 @@ Then drop **near-duplicates**. Outside segments, keep one **heartbeat** frame ev
 similar images get similar bits. The frame is split into 4×4 tiles with one hash each, so a few small people moving still change their
 tile. Distance = how many bits differ (*Hamming distance*).
 
+## Stages 3-4: events and frames for the index (`gpu_stages.py`, GPU)
+
+Only inside segments, 4 frames/s:
+- **tracks**: YOLO-World finds people and objects, ByteTrack follows them; rules turn tracks into events
+  (appears, loitering, running, object left behind, crowd)
+- **SigLIP**: compares each frame with text prompts ("a person carrying a box"...). Its image embeddings are also
+  what the search index stores
+- **X-CLIP**: the same for 8-frame clips, so it can see motion over time (falling, running)
+
+Then several **samplers** choose which of those frames go to the captioner and the index (`kcenter` by default),
+scored side by side with stage 2's keyframes. The chosen frames are written to `events/index_records.jsonl`
+(camera, time, events, objects) + `events/index_embeddings.npy` (SigLIP, 768 numbers per frame).
+
+Known weak spots (café video): track IDs switch in crowds, so one person can "appear" many times; `crowd` and
+`loitering` fire almost constantly in a busy lobby; X-CLIP rarely passes its threshold. The rules were written for
+outdoor CCTV and need tuning per scene.
+
 ## Outputs (`outputs/<video name>/`)
 
 | File | Contents |
@@ -105,10 +114,10 @@ tile. Distance = how many bits differ (*Hamming distance*).
 | Parameter | Where | Effect |
 |---|---|---|
 | `k` | `SEGMENT_PARAMS` | higher = only stronger motion counts, fewer segments |
-| `q_noise` | `SEGMENT_PARAMS` | share of quietest samples that defines "normal" (0.5; 1.0 = old behaviour) |
-| `mog2_color` | `SCAN_PARAMS` | MOG2 on colour (True) or greyscale (False, old behaviour) |
-| `method` | `SEGMENT_PARAMS` | `"mog2"` or `"diff"` |
-| `min_gap_s` | `KEYFRAME_PARAMS` | the main control of how many keyframes you get (3 s → 109, 10 s → 56) |
+| `q_noise` | `SEGMENT_PARAMS` | share of quietest samples that defines "normal" (0.5; 1.0 = all samples) |
+| `mog2_color` | `SCAN_PARAMS` | MOG2 on colour (True) or greyscale (False) |
+| `GATE` | notebook config (`method` in `SEGMENT_PARAMS` for the command line) | which gate feeds the later stages: `"mog2"` (default), `"diff"`, `"fused"`, `"deep"` |
+| `min_gap_s` | `KEYFRAME_PARAMS` | the main control of how many keyframes you get |
 | `change_threshold` | `KEYFRAME_PARAMS` | higher = a bigger scene change is needed for a new keyframe |
 | `heartbeat_s` | `KEYFRAME_PARAMS` | how often to sample quiet periods |
 | `ignore_polygons` | `SCAN_PARAMS` | regions to ignore (e.g. sky) |

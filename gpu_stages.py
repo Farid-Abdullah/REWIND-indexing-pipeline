@@ -1,74 +1,41 @@
-#!/usr/bin/env python3
-"""
-REWIND ingest pipeline: motion gating -> event detection -> adaptive sampling
-=============================================================================
+"""GPU stages of the REWIND pipeline (from Muzayyan's v2 pipeline). Used by pipeline.ipynb.
 
-One self-contained script. Point it at any video and it produces a searchable
-"ingest package": motion segments, detected events, object tracks, semantic
-embeddings and a small set of keyframes per event, all tied to camera + time.
+Stage 1 (diff + MOG2 motion gating) and the CPU keyframes live in motion_gating.py and keyframes.py.
+This file adds what needs deep models:
 
-    python rewind_pipeline.py video/cafe_demo.mp4 --camera-id cafe01 \
-        --start-time 2026-11-15T14:00:00 --device cuda
+  Deep gate   scan_deep: DINOv2 patch features vs a slowly learned background -> score_deep, a third
+              motion score next to diff and MOG2 (2 frames/s)
+  Stage 3     events, only inside motion segments, 4 frames/s:
+                tracks  YOLO-World detector + ByteTrack -> rules: appears, loitering, running,
+                        object_left, crowd
+                siglip  SigLIP zero-shot frame tags vs an event prompt bank; the same embeddings
+                        are the search index
+                xclip   X-CLIP zero-shot 8-frame clip tags (sees motion over time)
+              merged into one event table + an importance curve
+  Stage 4     samplers: which candidate frames go to the captioner / index
+                phash (one global hash) | novelty (new in SigLIP space) | kcenter (importance-weighted
+                coverage, primary) | importance (along the importance curve), all scored with
+                coverage / redundancy / event recall / track recall
+  Hand-off    write_index_records: index_records.jsonl + index_embeddings.npy
 
-    # CPU smoke test without downloading any model (numbers are meaningless):
-    python rewind_pipeline.py video/cafe_demo.mp4 --mock-models
-
-Stages and methods (each stage runs every method so they can be compared;
-the "primary" one feeds the next stage):
-
-  Stage 1  MOTION GATING        (cheap, every frame at sample_fps; goal = recall)
-    G1 diff    frame differencing                       (baseline, kept from v1)
-    G2 mog2    MOG2 + NCC lighting filter               (baseline, kept from v1)
-    G3 deep    DINOv2 patch-feature background model:   per-patch cosine change
-               against an adaptive feature-space background, scored with a
-               per-patch running z-score. Robust to lighting, noise, compression.
-    -> fused   soft 2-of-3 vote over threshold-normalised scores (primary gate)
-
-  Stage 2  EVENT DETECTION      (only inside gated segments, at event_fps)
-    E1 tracks  YOLO-World open-vocabulary detector + ByteTrack -> track events
-               (appears, loitering, running, object_left, crowd)
-    E2 siglip  SigLIP zero-shot frame scoring against an event prompt bank,
-               margin over "nothing happening" prompts, hysteresis in time.
-               The same embeddings become the search index for retrieval.
-    E3 xclip   X-CLIP zero-shot *video* (8-frame clip) classification, which
-               sees motion over time (falling, fighting, running) that a single
-               frame cannot.
-    -> events  merged table with cross-method support counts + importance curve
-
-  Stage 3  ADAPTIVE SAMPLING    (which frames go to the VLM captioner / index)
-    S0 phash      perceptual-hash change keyframes        (baseline, v1 logic)
-    S1 novelty    online semantic novelty in SigLIP space (streaming-friendly)
-    S2 kcenter    importance-weighted k-center greedy coverage, seeded with
-                  event anchors, adaptive budget (stops when covered) (primary)
-    S3 importance inverse-CDF sampling of the event-importance curve + anchors
-
-Every sampler picks from the SAME candidate pool so the comparison is fair,
-and each is scored with coverage / redundancy / event-recall / track-recall.
-
-Dependencies:  opencv-python numpy pandas matplotlib
-Deep methods:  torch transformers ultralytics lap sentencepiece protobuf   (each missing one is skipped)
-               SigLIP's tokenizer needs sentencepiece: without it SigLIP, the embeddings and
-               the novelty / kcenter / importance samplers are all skipped.
-
-The notebook pipeline.ipynb imports this file for the deep gate and stages 2-3 and uses
-motion_gating.py / keyframes.py for stage 1 and the CPU keyframes.
+Extra packages: torch transformers ultralytics lap sentencepiece protobuf. A model that can't load is
+skipped with a warning (Models.failed). SigLIP's tokenizer needs sentencepiece.
 """
 from __future__ import annotations
 
-import argparse
 import copy
 import hashlib
 import json
-import math
 import time
 import warnings
-from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import timedelta
 from pathlib import Path
 
 import cv2
 import numpy as np
 import pandas as pd
+
+from video_utils import format_hms, read_frames
 
 # =============================================================================
 # Configuration
@@ -106,21 +73,9 @@ BACKGROUND_PROMPTS = {
 }
 
 DEFAULT_CONFIG = {
-    "scan": {  # stage 1, one decode pass
-        "sample_fps": 5.0,          # analysed frames per second of video
-        "width": 320,               # analysis width for diff / MOG2
-        "blur_ksize": 5,
-        "diff_threshold": 15,
-        "mog2_history": 500,
-        "mog2_var_threshold": 16.0,
-        "mog2_learning_rate": -1.0,
-        "mog2_illum_ncc": 0.7,      # None disables the lighting filter
-        "mog2_min_blob_px": 12,
-        "morph_kernel": 3,
+    "deep_gate": {  # DINOv2 motion gate (scan_deep)
         "ignore_polygons": [],      # normalised [(x, y), ...] polygons to ignore
-        # G3 deep feature gate
-        "deep_enabled": True,
-        "deep_fps": 2.0,            # deep gate runs slower than sample_fps, then is interpolated
+        "deep_fps": 2.0,            # runs slower than stage 1's 5 samples/s; held constant in between
         "deep_model": "facebook/dinov2-small",
         "deep_input_h": 224,        # multiple of 14 (DINOv2 patch); width follows aspect ratio
         "deep_z": 3.0,              # per-patch z-score for "changed"
@@ -132,18 +87,6 @@ DEFAULT_CONFIG = {
         "batch_size": 16,
     },
     "segments": {
-        "methods": ["diff", "mog2", "deep"],
-        "primary": "fused",         # "fused", "diff", "mog2" or "deep"
-        "fusion": "soft_vote",      # "soft_vote" (mean of top-2 ratios) or "union" (max ratio)
-        "k": 3.0,                   # adaptive threshold = median + k * MAD
-        "floor": {"diff": 0.001, "mog2": 0.001, "deep": 0.004},
-        "threshold_mode": "adaptive",
-        "fixed_threshold": {"diff": 0.006, "mog2": 0.004, "deep": 0.02},
-        "stop_ratio": 0.5,
-        "smooth_s": 1.0,
-        "merge_gap_s": 3.0,
-        "min_duration_s": 1.0,
-        "pad_s": 2.0,
         "heartbeat_s": 300.0,       # idle frames kept so empty scenes are still indexed
     },
     "events": {
@@ -220,78 +163,11 @@ def log(msg: str) -> None:
 # Video helpers
 # =============================================================================
 
-@dataclass
-class VideoInfo:
-    path: str
-    fps: float
-    frame_count: int
-    width: int
-    height: int
-
-    @property
-    def duration_s(self) -> float:
-        return self.frame_count / self.fps if self.fps else 0.0
-
-
-def video_info(path) -> VideoInfo:
-    cap = cv2.VideoCapture(str(path))
-    if not cap.isOpened():
-        raise FileNotFoundError(f"cannot open video: {path}")
-    fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
-    if not np.isfinite(fps) or fps <= 0:
-        fps = 25.0
-    info = VideoInfo(str(path), float(fps), int(cap.get(cv2.CAP_PROP_FRAME_COUNT)),
-                     int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)))
-    cap.release()
-    return info
-
-
-def format_hms(t: float) -> str:
-    t = max(0.0, float(t))
-    h, rem = divmod(t, 3600)
-    m, s = divmod(rem, 60)
-    return f"{int(h):02d}:{int(m):02d}:{s:06.3f}"
-
-
 def resize_w(img, width):
     h, w = img.shape[:2]
     if w == width:
         return img
     return cv2.resize(img, (width, max(1, round(h * width / w))), interpolation=cv2.INTER_AREA)
-
-
-def iter_frames(path, step: int):
-    """Yield (frame_idx, bgr) every `step` frames, decoding sequentially (exact, no seek drift)."""
-    cap = cv2.VideoCapture(str(path))
-    idx = 0
-    while True:
-        if idx % step == 0:
-            ok, frame = cap.read()
-            if not ok:
-                break
-            yield idx, frame
-        elif not cap.grab():
-            break
-        idx += 1
-    cap.release()
-
-
-def frames_at(path, idxs) -> dict:
-    """Return {frame_idx: bgr} for the requested frames with one sequential pass."""
-    want = sorted(set(int(i) for i in idxs))
-    out, cap, cur = {}, cv2.VideoCapture(str(path)), 0
-    for target in want:
-        while cur < target:
-            if not cap.grab():
-                break
-            cur += 1
-        ok, fr = cap.read()
-        if not ok:
-            break
-        out[target] = fr
-        cur += 1
-    cap.release()
-    return out
 
 
 def polygon_mask(shape_hw, polygons):
@@ -545,7 +421,7 @@ class Models:
         return self._cache[key]
 
     def patch(self):
-        s = self.cfg["scan"]
+        s = self.cfg["deep_gate"]
         return self._get("deep_patch", lambda: MockPatchEncoder() if self.mock else
                          PatchEncoder(s["deep_model"], self.device, self.rt["fp16"], s["deep_input_h"]))
 
@@ -567,7 +443,7 @@ class Models:
 
 
 # =============================================================================
-# STAGE 1 - motion gating
+# Deep gate (DINOv2); scan_deep at the bottom runs it over a video
 # =============================================================================
 
 class DeepFeatureGate:
@@ -618,230 +494,16 @@ class DeepFeatureGate:
         return float(fg[self.keep].mean()) if self.keep.any() else 0.0, fg
 
 
-def _illumination_filter(fg, gray, bg_gray, ncc_thr, min_px):
-    """Remove MOG2 blobs whose texture matches the background (NCC high) = lighting change."""
-    n, lab, stats, _ = cv2.connectedComponentsWithStats(fg.astype(np.uint8), connectivity=8)
-    removed = np.zeros_like(fg, bool)
-    for i in range(1, n):
-        x, y, w, h, area = stats[i]
-        if area < min_px:
-            removed |= lab == i
-            continue
-        m = lab[y:y + h, x:x + w] == i
-        a = gray[y:y + h, x:x + w][m].astype(np.float32)
-        b = bg_gray[y:y + h, x:x + w][m].astype(np.float32)
-        a -= a.mean()
-        b -= b.mean()
-        den = math.sqrt(float((a * a).sum() * (b * b).sum()))
-        if den > 0 and float((a * b).sum()) / den > ncc_thr:
-            removed[y:y + h, x:x + w] |= m
-    return fg & ~removed, removed
-
-
-def _hash_params(*objs) -> str:
-    return hashlib.sha1(json.dumps(objs, sort_keys=True, default=str).encode()).hexdigest()[:12]
-
-
-def scan_video(video, cfg, models: Models, cache_dir: Path | None):
-    """One decode pass: per-sample diff, MOG2 and deep-feature scores + pHash + luma."""
-    s = cfg["scan"]
-    info = video_info(video)
-    st = Path(video).stat()
-    key = _hash_params(s, str(Path(video).resolve()), st.st_size, int(st.st_mtime),
-                       cfg["runtime"]["mock_models"])
-    cache = cache_dir / f"scan_{key}.csv" if cache_dir else None
-    if cache and cache.exists():
-        df = pd.read_csv(cache)
-        return df, {"from_cache": True, "samples": len(df), "scan_s": 0.0}
-
-    step = max(1, round(info.fps / s["sample_fps"]))
-    deep_every = max(1, round(s["sample_fps"] / s["deep_fps"])) if s["deep_enabled"] else 0
-    enc = models.patch() if s["deep_enabled"] else None
-    mog = cv2.createBackgroundSubtractorMOG2(s["mog2_history"], s["mog2_var_threshold"], detectShadows=True)
-    kernel = np.ones((s["morph_kernel"],) * 2, np.uint8) if s["morph_kernel"] else None
-    bk = s["blur_ksize"] | 1
-    keep, prev, gate = None, None, None
-    rows, deep_buf, deep_rows = [], [], []
-
-    def flush_deep():
-        if not deep_buf:
-            return
-        feats = enc([f for _, f in deep_buf])
-        for (ri, _), f in zip(deep_buf, feats):
-            score, _ = gate.update(f)
-            deep_rows.append((ri, score))
-        deep_buf.clear()
-
-    t0 = time.perf_counter()
-    for k, (idx, frame) in enumerate(iter_frames(video, step)):
-        small = resize_w(frame, s["width"])
-        if keep is None:
-            keep = polygon_mask(small.shape[:2], s["ignore_polygons"])
-            gate = DeepFeatureGate(s, keep) if enc is not None else None
-        blur = cv2.GaussianBlur(small, (bk, bk), 0)
-        gray = cv2.cvtColor(blur, cv2.COLOR_BGR2GRAY)
-        # G1 frame differencing
-        if prev is None:
-            sd = 0.0
-        else:
-            m = cv2.absdiff(gray, prev) > s["diff_threshold"]
-            if kernel is not None:
-                m = cv2.morphologyEx(m.astype(np.uint8), cv2.MORPH_OPEN, kernel).astype(bool)
-            sd = float(m[keep].mean())
-        prev = gray
-        # G2 MOG2 + lighting filter
-        fg = mog.apply(blur, learningRate=s["mog2_learning_rate"]) == 255  # 127 = shadow, dropped
-        if kernel is not None:
-            fg = cv2.morphologyEx(fg.astype(np.uint8), cv2.MORPH_OPEN, kernel).astype(bool)
-        raw = float(fg[keep].mean())
-        if s["mog2_illum_ncc"] is not None and fg.any():
-            bgimg = mog.getBackgroundImage()
-            if bgimg is not None:
-                fg, _ = _illumination_filter(fg, gray, cv2.cvtColor(bgimg, cv2.COLOR_BGR2GRAY),
-                                             s["mog2_illum_ncc"], s["mog2_min_blob_px"])
-        rows.append({"frame_idx": idx, "timestamp_s": idx / info.fps, "score_diff": sd,
-                     "score_mog2": float(fg[keep].mean()), "score_mog2_raw": raw,
-                     "mean_luma": float(gray.mean()),
-                     "phash": np.packbits(phash64(gray)).tobytes().hex()})
-        # G3 deep feature gate (batched, lower rate)
-        if gate is not None and k % deep_every == 0:
-            deep_buf.append((len(rows) - 1, frame))
-            if len(deep_buf) >= s["batch_size"]:
-                flush_deep()
-    if gate is not None:
-        flush_deep()
-    scan_s = time.perf_counter() - t0
-
-    df = pd.DataFrame(rows)
-    if deep_rows:
-        ri, sc = map(np.array, zip(*deep_rows))
-        # hold the deep score over its own sampling interval (step-wise, no smoothing of peaks)
-        full = np.full(len(df), np.nan)
-        full[ri] = sc
-        df["score_deep"] = pd.Series(full).ffill().fillna(0).to_numpy()
-    if cache:
-        cache.parent.mkdir(parents=True, exist_ok=True)
-        df.to_csv(cache, index=False)
-    return df, {"from_cache": False, "samples": len(df), "step": step, "scan_s": scan_s,
-                "samples_per_s": len(df) / max(scan_s, 1e-9),
-                "realtime_factor": info.duration_s / max(scan_s, 1e-9)}
-
-
 def smooth(x, win):
     return pd.Series(x).rolling(max(1, int(win)), center=True, min_periods=1).mean().to_numpy()
-
-
-def adaptive_threshold(x, k, floor, q_noise=0.5):
-    """Noise-floor threshold estimated from the quieter part of the signal.
-
-    Plain median + k*MAD breaks when a camera is active more than half the time: the median
-    *is* motion and the threshold rises above real events. Here baseline and spread come only
-    from samples at or below the `q_noise` quantile, which assumes at least that share of the
-    time is idle (true for almost all CCTV), and the floor protects perfectly clean video."""
-    x = np.asarray(x, float)
-    low = x[x <= np.quantile(x, q_noise)] if len(x) else x
-    if low.size == 0:
-        return floor
-    med = float(np.median(low))
-    mad = 1.4826 * float(np.median(np.abs(low - med)))
-    return max(floor, med + k * mad)
-
-
-def hysteresis_segments(t, x, start, stop, merge_gap_s, min_duration_s, pad_s, duration_s, dt):
-    segs, active, s0 = [], False, 0.0
-    for ti, xi in zip(t, x):
-        if not active and xi >= start:
-            active, s0 = True, ti
-        elif active and xi < stop:
-            active = False
-            segs.append([s0, ti])
-    if active:
-        segs.append([s0, t[-1] + dt])
-
-    def merge(ss, gap):
-        out = []
-        for a, b in ss:
-            if out and a - out[-1][1] <= gap:
-                out[-1][1] = max(out[-1][1], b)
-            else:
-                out.append([a, b])
-        return out
-
-    segs = [s for s in merge(segs, merge_gap_s) if s[1] - s[0] >= min_duration_s]
-    segs = [[max(0.0, a - pad_s), min(duration_s, b + pad_s)] for a, b in segs]
-    return merge(segs, 0.0)
-
-
-def segment_table(segs, scores, col, fps):
-    rows = []
-    t, x = scores["timestamp_s"].to_numpy(), scores[col].to_numpy()
-    for i, (a, b) in enumerate(segs):
-        m = (t >= a) & (t <= b)
-        j = np.flatnonzero(m)[np.argmax(x[m])] if m.any() else int(np.argmin(np.abs(t - a)))
-        rows.append({"segment_id": i, "start_s": a, "end_s": b, "duration_s": b - a,
-                     "peak_score": float(x[j]), "mean_score": float(x[m].mean()) if m.any() else 0.0,
-                     "peak_time_s": float(t[j]), "peak_frame_idx": int(scores["frame_idx"].iat[j]),
-                     "start_hms": format_hms(a), "end_hms": format_hms(b)})
-    return pd.DataFrame(rows, columns=["segment_id", "start_s", "end_s", "duration_s", "peak_score",
-                                       "mean_score", "peak_time_s", "peak_frame_idx", "start_hms", "end_hms"])
-
-
-def active_mask(t, segs_df):
-    m = np.zeros(len(t), bool)
-    for a, b in zip(segs_df["start_s"], segs_df["end_s"]):
-        m |= (t >= a) & (t <= b)
-    return m
 
 
 def active_fraction(segs_df, duration):
     return float(segs_df["duration_s"].sum() / duration) if len(segs_df) and duration else 0.0
 
 
-def run_gating(scores, info, cfg):
-    """Thresholds + segments for every gate, plus the fused gate."""
-    g = cfg["segments"]
-    t = scores["timestamp_s"].to_numpy()
-    dt = float(np.median(np.diff(t))) if len(t) > 1 else 1.0 / cfg["scan"]["sample_fps"]
-    win = round(g["smooth_s"] / dt)
-    seg_kw = dict(merge_gap_s=g["merge_gap_s"], min_duration_s=g["min_duration_s"], pad_s=g["pad_s"],
-                  duration_s=info.duration_s, dt=dt)
-    results, ratios = {}, {}
-    for m in g["methods"]:
-        col = f"score_{m}"
-        if col not in scores:
-            continue
-        xs = smooth(scores[col].to_numpy(), win)
-        start = (adaptive_threshold(xs, g["k"], g["floor"].get(m, 0.0)) if g["threshold_mode"] == "adaptive"
-                 else g["fixed_threshold"][m])
-        stop = start * g["stop_ratio"]
-        segs = segment_table(hysteresis_segments(t, xs, start, stop, **seg_kw), scores, col, info.fps)
-        results[m] = {"col": col, "start": start, "stop": stop, "segments": segs}
-        ratios[m] = xs / start
-    if len(ratios) >= 1:
-        R = np.vstack(list(ratios.values()))
-        if g["fusion"] == "union" or R.shape[0] == 1:
-            fused = R.max(0)
-        else:  # soft 2-of-N vote: mean of the two highest normalised scores
-            fused = np.sort(R, 0)[-2:].mean(0)
-        scores["score_fused"] = fused
-        segs = segment_table(hysteresis_segments(t, fused, 1.0, g["stop_ratio"], **seg_kw),
-                             scores, "score_fused", info.fps)
-        results["fused"] = {"col": "score_fused", "start": 1.0, "stop": g["stop_ratio"], "segments": segs}
-    return results
-
-
-def gate_agreement(results, t):
-    names = list(results)
-    masks = {m: active_mask(t, results[m]["segments"]) for m in names}
-    rows = []
-    for a in names:
-        rows.append({b: (float((masks[a] & masks[b]).sum() / max(1, (masks[a] | masks[b]).sum())))
-                     for b in names})
-    return pd.DataFrame(rows, index=names)
-
-
 # =============================================================================
-# STAGE 2 - event detection
+# Stage 3 - event detection
 # =============================================================================
 
 def build_windows(segments, info, heartbeat_s, pad_s=0.0):
@@ -1160,7 +822,7 @@ def event_anchors(meta, events, track_summary, cfg):
 
 
 # =============================================================================
-# STAGE 3 - adaptive sampling
+# Stage 4 - adaptive sampling
 # =============================================================================
 
 def _budget(dur_s, mean_imp, c):
@@ -1311,42 +973,6 @@ def evaluate_sampling(meta, E, keep, events, track_summary, info, c):
 
 
 # =============================================================================
-# Ground-truth evaluation (optional): CSV with start_s,end_s[,label]
-# =============================================================================
-
-def evaluate_against_gt(gt, gate_results, scores, meta, keeps, info, iou_thr=0.3):
-    t = scores["timestamp_s"].to_numpy()
-    gt_mask = np.zeros(len(t), bool)
-    for a, b in zip(gt.start_s, gt.end_s):
-        gt_mask |= (t >= a) & (t <= b)
-    gate_rows = {}
-    for m, r in gate_results.items():
-        segs = r["segments"]
-        pm = active_mask(t, segs)
-        tp = (pm & gt_mask).sum()
-        prec, rec = tp / max(1, pm.sum()), tp / max(1, gt_mask.sum())
-
-        def hit(a, b):
-            for s, e in zip(segs.start_s, segs.end_s):
-                inter = max(0, min(b, e) - max(a, s))
-                if inter / max(1e-9, (b - a)) > 0.5 or inter / max(1e-9, max(b, e) - min(a, s)) >= iou_thr:
-                    return True
-            return False
-
-        ev_rec = np.mean([hit(a, b) for a, b in zip(gt.start_s, gt.end_s)]) if len(gt) else np.nan
-        gate_rows[m] = {"frame_precision": prec, "frame_recall": rec,
-                        "frame_f1": 2 * prec * rec / max(1e-9, prec + rec),
-                        "event_recall": ev_rec, "active_pct": 100 * active_fraction(segs, info.duration_s)}
-    samp_rows = {}
-    mt = meta["timestamp_s"].to_numpy()
-    for name, keep in keeps.items():
-        kt = mt[np.array(keep, int)] if len(keep) else np.array([])
-        samp_rows[name] = {"gt_events_with_keyframe": float(np.mean(
-            [np.any((kt >= a) & (kt <= b)) for a, b in zip(gt.start_s, gt.end_s)])) if len(gt) else np.nan}
-    return pd.DataFrame(gate_rows).T, pd.DataFrame(samp_rows).T
-
-
-# =============================================================================
 # Outputs
 # =============================================================================
 
@@ -1354,7 +980,7 @@ def export_keyframes(video, info, meta, keep, out_dir, name, camera_id):
     d = out_dir / "keyframes" / name
     d.mkdir(parents=True, exist_ok=True)
     rows = meta.loc[keep]
-    frames = frames_at(video, rows.frame_idx)
+    frames = dict(read_frames(video, rows.frame_idx))
     files = []
     for r in rows.itertuples():
         fn = f"{camera_id}_{format_hms(r.timestamp_s).replace(':', '-')}_" + \
@@ -1432,175 +1058,72 @@ def plot_timeline(path, scores, gate_results, primary, events, keeps, info):
 
 
 # =============================================================================
-# Orchestration
+# Deep gate over a whole video
 # =============================================================================
 
-def run(video, cfg, out_root="outputs", camera_id=None, start_time=None, gt_csv=None, stages=(1, 2, 3)):
-    video = Path(video)
-    info = video_info(video)
-    camera_id = camera_id or video.stem
-    out = Path(out_root) / video.stem
-    out.mkdir(parents=True, exist_ok=True)
-    t_start = datetime.fromisoformat(start_time) if start_time else None
-    models = Models(cfg)
-    timings, summary = {}, {"video": str(video), "camera_id": camera_id, "duration_s": info.duration_s,
-                            "fps": info.fps, "resolution": f"{info.width}x{info.height}",
-                            "device": models.device, "mock_models": models.mock}
-    log(f"{video.name}: {format_hms(info.duration_s)} @ {info.fps:.2f} fps, {info.width}x{info.height}, "
-        f"device={models.device}{' (MOCK MODELS)' if models.mock else ''}")
 
-    # ---------------- stage 1
+def scan_deep(video_path, scores: pd.DataFrame, cfg: dict, models: "Models",
+              cache_dir: str | Path | None = None) -> tuple[np.ndarray | None, dict]:
+    """Deep-gate score for every row of `scores` (same samples as stage 1), added to them as score_deep.
+
+    How it works (DeepFeatureGate): every frame is cut into 14x14-pixel patches and DINOv2
+    turns each patch into a feature vector. Each patch keeps a slowly updated "background" vector; a patch
+    counts as moving when it differs from its background much more than usual. Score = share of patches
+    moving. Runs at `deep_fps` (2/s) and is held constant in between.
+    
+    Needs torch + transformers and, realistically, a GPU. If the model can't load, scan_deep returns None
+    and the notebook simply leaves the deep gate out.
+    Known weakness (seen on cafe_demo.mp4): the first frames become the background, so people present at
+    the start count as "change" until the slow update absorbs them (about a minute).
+
+
+    cfg:    DEFAULT_CONFIG plus overrides; uses cfg["deep_gate"] and cfg["runtime"]["mock_models"]
+    models: Models(cfg); models.patch() loads DINOv2 (or a mock)
+    Returns (score array or None if the model is unavailable, stats dict). Cached in cache_dir.
+    """
+    s = cfg["deep_gate"]
+    video_path = Path(video_path)
+    keys = ["deep_fps", "deep_model", "deep_input_h", "deep_z", "deep_min_dist", "deep_alpha_bg",
+            "deep_alpha_fg", "deep_alpha_stats", "deep_warmup", "ignore_polygons"]
+    ident = {"video": video_path.name, "size": video_path.stat().st_size, "n": len(scores),
+             "mock": cfg["runtime"]["mock_models"], **{k: s[k] for k in keys}}
+    key = hashlib.sha1(json.dumps(ident, sort_keys=True, default=str).encode()).hexdigest()[:12]
+    cache = Path(cache_dir) / f"deep_{key}.npz" if cache_dir else None
+    if cache and cache.exists():
+        z = np.load(cache)
+        return z["score"], {"from_cache": True, "deep_s": 0.0}
+
+    enc = models.patch()
+    if enc is None:
+        return None, {"skipped": models.failed.get("deep_patch", "model unavailable")}
+
+    period = float(np.median(np.diff(scores["timestamp_s"])))
+    every = max(1, round((1.0 / period) / s["deep_fps"]))     # 5 samples/s / 2 per s -> every 2nd sample
+    rows = np.arange(0, len(scores), every)
+    fidx = scores["frame_idx"].to_numpy()[rows]
+    gate, out, buf, buf_rows = None, np.full(len(scores), np.nan), [], []
     t0 = time.perf_counter()
-    scores, st = scan_video(video, cfg, models, out / "cache" if cfg["runtime"]["cache"] else None)
-    gates = run_gating(scores, info, cfg)
-    timings["stage1"] = time.perf_counter() - t0
-    primary = cfg["segments"]["primary"] if cfg["segments"]["primary"] in gates else next(iter(gates))
-    segments = gates[primary]["segments"]
-    scores.drop(columns="phash").to_csv(out / "motion_scores.csv", index=False)
-    for m, r in gates.items():
-        r["segments"].to_csv(out / f"segments_{m}.csv", index=False)
-    agree = gate_agreement(gates, scores.timestamp_s.to_numpy())
-    agree.to_csv(out / "gate_agreement_iou.csv")
-    summary["stage1"] = {"scan": st, "primary": primary, "gates": {
-        m: {"start_threshold": r["start"], "segments": len(r["segments"]),
-            "active_pct": 100 * active_fraction(r["segments"], info.duration_s)} for m, r in gates.items()}}
-    for m, r in gates.items():
-        log(f"  gate {m:5s}: thr {r['start']:.4f} -> {len(r['segments'])} segments, "
-            f"{active_fraction(r['segments'], info.duration_s):.1%} active" + ("  <- primary" if m == primary else ""))
-    if 2 not in stages:
-        return _finish(out, summary, timings, info)
 
-    # ---------------- stage 2
-    t0 = time.perf_counter()
-    feat = extract_event_features(video, info, segments, cfg, models)
-    meta, E = feat["meta"], feat["emb"]
-    ev_tr, track_sum = track_events(feat["tracks"], cfg) if "tracks" in cfg["events"]["methods"] \
-        else (pd.DataFrame(), pd.DataFrame())
-    ev_sg, sg_extra = siglip_events(feat, cfg, models) if "siglip" in cfg["events"]["methods"] \
-        else (pd.DataFrame(), None)
-    ev_xc = xclip_events(feat, cfg) if "xclip" in cfg["events"]["methods"] else pd.DataFrame()
-    events = merge_events([ev_tr, ev_sg, ev_xc], cfg["events"]["merge_gap_s"])
-    imp = importance_curve(meta, scores, gates[primary]["col"], events, track_sum, cfg)
-    anchors = event_anchors(meta, events, track_sum, cfg)
-    timings["stage2"] = time.perf_counter() - t0
-    meta["importance"] = imp
-    if sg_extra is not None:
-        meta["siglip_tag"] = sg_extra["tags"]
-    if t_start:
-        for df in (events,):
-            if len(df):
-                df["start_wallclock"] = [(t_start + timedelta(seconds=float(s))).isoformat() for s in df.start_s]
-    events.insert(1, "camera_id", camera_id)
-    events.to_csv(out / "events.csv", index=False)
-    feat["tracks"].to_csv(out / "tracks_raw.csv", index=False)
-    track_sum.to_csv(out / "tracks.csv", index=False)
-    feat["xclip"].to_csv(out / "xclip_windows.csv", index=False)
-    np.save(out / "candidate_embeddings.npy", E.astype(np.float16))
-    meta.to_csv(out / "candidate_frames.csv", index=False)
-    summary["stage2"] = {**feat["stats"], "events": int(len(events)),
-                         "events_by_source": events.source.value_counts().to_dict() if len(events) else {},
-                         "events_multi_source": int((events.support >= 2).sum()) if len(events) else 0,
-                         "tracks": int(len(track_sum)), "embedding_dim": int(E.shape[1])}
-    log(f"  events: {len(events)} ({summary['stage2']['events_by_source']}), "
-        f"{summary['stage2']['events_multi_source']} confirmed by 2+ methods, {len(track_sum)} tracks, "
-        f"{len(meta)} candidate frames")
-    if 3 not in stages:
-        return _finish(out, summary, timings, info)
+    def flush():
+        for r, f in zip(buf_rows, enc(buf)):
+            out[r] = gate.update(f)[0]
+        buf.clear()
+        buf_rows.clear()
 
-    # ---------------- stage 3
-    t0 = time.perf_counter()
-    c = cfg["sampling"]
-    keeps, evals = {}, {}
-    for name in c["methods"]:
-        if name != "phash" and E.shape[1] == 0:
-            log(f"  sampler {name}: skipped (no embeddings)")
-            continue
-        keeps[name] = SAMPLERS[name](meta, c, E=E, imp=imp, anchors=anchors)
-        evals[name] = evaluate_sampling(meta, E, keeps[name], events, track_sum, info, c)
-    timings["stage3"] = time.perf_counter() - t0
-    ev_df = pd.DataFrame(evals).T
-    ev_df.to_csv(out / "sampling_comparison.csv")
-    log("  sampling comparison:\n" + ev_df.round(3).to_string())
-    for name, keep in keeps.items():
-        kf = meta.loc[keep].assign(camera_id=camera_id, sampler=name)
-        kf["timestamp_hms"] = kf.timestamp_s.map(format_hms)
-        if name in c["export_jpgs"]:
-            kf["filename"] = export_keyframes(video, info, meta, keep, out, name, camera_id)
-        kf.drop(columns="phash").to_csv(out / f"keyframes_{name}.csv")
-    # index records for the primary sampler: the hand-off to captioning / indexing
-    psamp = c["primary"] if c["primary"] in keeps else next(iter(keeps))
-    write_index_records(out, meta, keeps[psamp], E, events, track_sum, camera_id, video.name, t_start)
-    summary["stage3"] = {"primary": psamp, "comparison": evals}
-
-    if gt_csv:
-        gt = pd.read_csv(gt_csv)
-        g_tab, s_tab = evaluate_against_gt(gt, gates, scores, meta, keeps, info)
-        g_tab.to_csv(out / "gt_eval_gates.csv")
-        s_tab.to_csv(out / "gt_eval_sampling.csv")
-        summary["gt_eval"] = {"gates": g_tab.to_dict("index"), "sampling": s_tab.to_dict("index")}
-        log("  ground-truth eval (gates):\n" + g_tab.round(3).to_string())
-    plot_timeline(out / "timeline.png", scores, gates, primary, events,
-                  {n: meta.timestamp_s.to_numpy()[k] for n, k in keeps.items()}, info)
-    return _finish(out, summary, timings, info)
-
-
-def _finish(out, summary, timings, info):
-    timings["total"] = sum(timings.values())
-    summary["timings_s"] = timings
-    summary["realtime_factor_total"] = info.duration_s / max(timings["total"], 1e-9)
-    with open(out / "summary.json", "w") as f:
-        json.dump(summary, f, indent=2, default=lambda o: o.item() if hasattr(o, "item") else str(o))
-    log(f"done in {timings['total']:.1f} s ({summary['realtime_factor_total']:.1f}x real time) -> {out}")
-    return summary
-
-
-def parse_args(argv=None):
-    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("video", nargs="?")
-    p.add_argument("--out", default="outputs")
-    p.add_argument("--config", help="JSON file overriding DEFAULT_CONFIG (nested keys)")
-    p.add_argument("--camera-id")
-    p.add_argument("--start-time", help="ISO wall-clock time of frame 0, e.g. 2026-11-15T14:00:00")
-    p.add_argument("--gt", help="ground-truth CSV with start_s,end_s[,label]")
-    p.add_argument("--stages", default="1,2,3")
-    p.add_argument("--gate", help="primary gate: fused|diff|mog2|deep")
-    p.add_argument("--sampler", help="primary sampler: phash|novelty|kcenter|importance")
-    p.add_argument("--device", help="auto|cuda|cpu|mps")
-    p.add_argument("--no-deep-gate", action="store_true")
-    p.add_argument("--no-cache", action="store_true")
-    p.add_argument("--mock-models", action="store_true", help="smoke test without real models")
-    p.add_argument("--dump-config", action="store_true", help="print the default config and exit")
-    return p.parse_args(argv)
-
-
-def main(argv=None):
-    a = parse_args(argv)
-    if a.dump_config:
-        print(json.dumps(DEFAULT_CONFIG, indent=2))
-        return
-    if not a.video:
-        raise SystemExit("error: video path required")
-    cfg = DEFAULT_CONFIG
-    if a.config:
-        cfg = deep_update(cfg, json.loads(Path(a.config).read_text()))
-    over = {"runtime": {}, "segments": {}, "sampling": {}, "scan": {}}
-    if a.gate:
-        over["segments"]["primary"] = a.gate
-    if a.sampler:
-        over["sampling"]["primary"] = a.sampler
-        over["sampling"]["export_jpgs"] = [a.sampler]
-    if a.device:
-        over["runtime"]["device"] = a.device
-    if a.no_deep_gate:
-        over["scan"]["deep_enabled"] = False
-        over["segments"]["methods"] = [m for m in cfg["segments"]["methods"] if m != "deep"]
-    if a.no_cache:
-        over["runtime"]["cache"] = False
-    if a.mock_models:
-        over["runtime"]["mock_models"] = True
-    cfg = deep_update(cfg, over)
-    run(a.video, cfg, a.out, a.camera_id, a.start_time, a.gt, tuple(int(s) for s in a.stages.split(",")))
-
-
-if __name__ == "__main__":
-    main()
+    for (fi, frame), r in zip(read_frames(video_path, fidx), rows):
+        if gate is None:
+            small = resize_w(frame, 320)
+            gate = DeepFeatureGate(s, polygon_mask(small.shape[:2], s["ignore_polygons"]))
+        buf.append(frame)
+        buf_rows.append(r)
+        if len(buf) >= s["batch_size"]:
+            flush()
+    if buf:
+        flush()
+    elapsed = time.perf_counter() - t0
+    score = pd.Series(out).ffill().fillna(0.0).to_numpy()   # hold each value until the next deep sample
+    if cache:
+        cache.parent.mkdir(parents=True, exist_ok=True)
+        np.savez_compressed(cache, score=score)
+    return score, {"from_cache": False, "deep_s": elapsed, "deep_frames": int(len(rows)),
+                   "deep_frames_per_s": len(rows) / max(elapsed, 1e-9)}

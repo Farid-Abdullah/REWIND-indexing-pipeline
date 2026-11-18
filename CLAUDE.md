@@ -14,8 +14,8 @@ well-chosen frames to expensive models (captioning, indexing) instead of every f
   Windows. Don't remove that pin.
 - Also runs on the team's Linux VM (2x L4). There, envs live on the 5T disk (`/mnt/5T_storage/envs/...`, created with
   `conda env create -p`), and pip / Hugging Face caches must not go to the nearly full root disk.
-- GPU stages: `pip install -r requirements-gpu.txt`. `ultralytics` installs `opencv-python` next to
-  `opencv-python-headless`; having both can break `cv2`, so check `import cv2` afterwards.
+- GPU stages: `pip install torch transformers ultralytics lap sentencepiece protobuf`. `ultralytics` installs
+  `opencv-python` next to `opencv-python-headless`; having both can break `cv2`, so check `import cv2` afterwards.
 
 ## Commands
 
@@ -35,32 +35,28 @@ There are no tests. Check a change by re-running the notebook and comparing the 
 
 | Path | Role |
 |---|---|
-| `motion_gating.py` | Stage 1: frame diff + MOG2 (colour, NCC lighting filter), adaptive threshold on the quieter half, hysteresis segments, fused gate (`add_fused`) |
-| `deep_gate.py` | Optional DINOv2 gate: adds `score_deep` to stage 1's scores (uses `rewind_pipeline.DeepFeatureGate`) |
+| `pipeline.ipynb` | The demo notebook: every stage on one video. Committed **without** outputs |
+| `motion_gating.py` | Stage 1: frame diff + MOG2 (colour, NCC lighting filter), adaptive threshold on the quieter half, hysteresis segments, fused gate (`add_fused`); ground-truth checks (`gate_table`, `keyframe_hits`, `gate_agreement`) |
 | `keyframes.py` | Stage 2: first / peak / change (4x4 tile pHash) / maxgap keyframes, dedup, idle heartbeat |
-| `evaluate.py` | Ground truth (`start_s,end_s[,label]`): gate precision/recall/event recall, keyframe hits, gate agreement |
-| `rewind_pipeline.py` | v2 (Muzayyan, LLM-written): models, events, samplers, `write_index_records`. Imported by the notebook; also a standalone CLI |
-| `video_utils.py`, `visualize.py`, `visualize_events.py` | Frame reading, plots/GIFs, tracker-box drawing |
-| `pipeline.ipynb` | Main notebook (merged v1 + v2). Committed **without** outputs |
-| `explore.ipynb` | Older v1-only notebook, committed with MEVA outputs (~3 MB) |
+| `gpu_stages.py` | From Muzayyan's v2 (LLM-written): `Models` (lazy, skip on failure), DINOv2 gate (`scan_deep`), stage 3 events, stage 4 samplers, `write_index_records` |
+| `video_utils.py`, `visualize.py` | Frame reading; plots, GIFs, tracker-box drawing |
+| `meva_30min.py` | Downloads the 30-min MEVA test video |
 | `video/`, `outputs/` | Git-ignored. Videos and results stay local |
 
 The slow decode pass is cached in `outputs/<video>/cache/scan_<hash>.npz`. Changing a scan parameter
 invalidates it; changing a segment or keyframe parameter does not.
 
-## `rewind_pipeline.py` (v2) and the merge
+## `gpu_stages.py` and the v1/v2 merge
 
-Written with an LLM from v1's logic; it re-implemented diff + MOG2 inside one 1,600-line script. In the merge,
-`pipeline.ipynb` uses v1's modules for stage 1 and the CPU keyframes, and imports `rewind_pipeline.py` only for
-the DINOv2 gate, the models, stage 3 (YOLO-World + ByteTrack track rules, SigLIP zero-shot tags, X-CLIP) and
-stage 4 (samplers phash / novelty / kcenter / importance, scored together with v1's keyframes).
-Taken over from v2 into v1: the quieter-half threshold (`q_noise`), colour MOG2, the fused vote, GT evaluation.
+v2 was a standalone 1,600-line script that re-implemented diff + MOG2. In the merge its stage 1, CLI and duplicate
+helpers were removed (the original is still on `main` as `rewind_pipeline_Muzz.py`); what's left is only what needs
+deep models. Taken over from v2 into v1's modules: the quieter-half threshold (`q_noise`), colour MOG2, the fused
+vote, ground-truth evaluation.
 
-- Hand-off to the next stage: `outputs/<video>/events/index_records.jsonl` + `index_embeddings.npy` (SigLIP,
-  768-d for `siglip-base-patch16-224`), one record per keyframe of the primary sampler.
-- If a model fails to load, its method is skipped with a warning (`models.failed`). SigLIP needs `sentencepiece`.
+- Config: `gpu_stages.DEFAULT_CONFIG` (`deep_gate`, `segments.heartbeat_s`, `events`, `sampling`, `runtime`).
+- Hand-off: `outputs/<video>/events/index_records.jsonl` + `index_embeddings.npy` (SigLIP, 768-d for
+  `siglip-base-patch16-224`), one record per keyframe of the primary sampler (`kcenter`, falls back to `phash`).
+- A model that fails to load is skipped with a warning (`models.failed`). SigLIP needs `sentencepiece`.
 - Known weak spots (café video): track IDs switch in crowds, `crowd`/`loitering` fire constantly in busy scenes,
   X-CLIP's softmax over 13 prompts rarely passes `xclip_threshold` 0.35, the deep gate's first frames become its
   background (people there at the start count as change for ~1 min).
-- Standalone CLI still works: `python rewind_pipeline.py video/x.mp4 --out outputs_v2 [--mock-models] [--gt gt.csv]`
-  (use an `--out` other than `outputs`, or it overwrites v1's files).
