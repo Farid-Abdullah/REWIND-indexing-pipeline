@@ -41,6 +41,7 @@ There are no tests. Check a change by re-running the notebook and comparing the 
 | `gpu_stages.py` | From Muzayyan's v2 (LLM-written): `Models` (lazy, skip on failure), DINOv2 gate (`scan_deep`), stage 3 events, stage 4 samplers, `write_index_records` |
 | `video_utils.py`, `visualize.py` | Frame reading; plots, GIFs, tracker-box drawing |
 | `meva_30min.py` | Downloads the 30-min MEVA test video |
+| `docs/pipeline.md` | Method write-up with references; keep it in sync when a step or default changes |
 | `video/`, `outputs/` | Git-ignored. Videos and results stay local |
 
 The slow decode pass is cached in `outputs/<video>/cache/scan_<hash>.npz`. Changing a scan parameter

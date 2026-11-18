@@ -41,6 +41,7 @@ Any model that fails to load is skipped with a warning, so the notebook still ru
 | `video_utils.py`, `visualize.py` | Reading frames; thumbnails, plots and GIFs for the notebook |
 | `meva_30min.py` | Downloads six 5-min clips from the public MEVA dataset and joins them into `video/meva_30min.mp4` |
 | `environment.yml` | The conda environment (CPU part) |
+| `docs/pipeline.md` | How every step works, why, its weak spots, results so far, and the papers behind it (report material) |
 
 ## Stage 1: motion gating (`motion_gating.py`)
 
