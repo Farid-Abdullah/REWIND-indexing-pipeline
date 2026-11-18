@@ -45,7 +45,8 @@ Any model that fails to load is skipped with a warning, so the notebook still ru
 ## Stage 1: motion gating (`motion_gating.py`)
 
 1. **Look at 5 frames per second, not 30.** Neighbouring frames are almost identical, so this is 6× less work.
-2. **Shrink to 320 px, greyscale, blur.** Motion doesn't need colour or detail. This is faster, and blurring hides pixel noise.
+2. **Shrink to 320 px and blur.** Motion doesn't need detail. This is faster, and blurring hides pixel noise.
+   Frame differencing works on greyscale; MOG2 keeps the colour (see below).
 3. **Detect moving pixels, two ways** (plus the optional deep gate and a fused vote, see below):
    - *Frame differencing*: a pixel moved if its brightness changed a lot since the previous frame. Simple, but only sees things moving right now.
    - *MOG2 background subtraction*: learns what each pixel normally looks like over the last ~100 s. Anything that doesn't fit is "foreground". Used by default.
@@ -106,8 +107,10 @@ outdoor CCTV and need tuning per scene.
 | `segments.csv` | one row per segment: start, end, duration, peak motion |
 | `keyframes/` + `keyframes.csv` | the JPGs (`kf_00-12-34.500_seg007.jpg`) and one row each: time, segment, reason |
 | `motion_scores.csv` | every gate's score for every analysed frame |
-| `gt_eval_*.csv` | ground-truth results (if `GT_CSV` is set) |
-| `events/` | stages 3-4: `events.csv`, `tracks.csv`, `sampling_comparison.csv`, `keyframes_<sampler>.csv`, and the hand-off `index_records.jsonl` + `index_embeddings.npy` |
+| `gt_eval_gates.csv`, `gt_eval_keyframes.csv` | ground-truth results (only if `GT_CSV` is set) |
+| `gifs/` | animated previews of the strongest segments |
+| `cache/` | the slow decode pass (and the deep gate), so re-runs are fast. Safe to delete |
+| `events/` | stages 3-4 (GPU): `events.csv` (merged events), `tracks.csv` + `tracks_raw.csv`, `xclip_windows.csv`, `candidate_frames.csv`, `sampling_comparison.csv`, `keyframes_<sampler>.csv` (+ JPGs in `keyframes/kcenter/`), `gifs/`, `timeline.png`, and the hand-off **`index_records.jsonl` + `index_embeddings.npy`** |
 
 ## Main knobs
 
