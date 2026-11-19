@@ -4,6 +4,9 @@
 Expensive models (captioning, the search index) then only look at those frames instead of every frame.
 On the 30-min MEVA test video the v1 settings kept 109 keyframes instead of 1,801 (1 per second), 16.5× fewer.
 
+**Docs:** `docs/explanation.md` walks through every step and setting (for tuning) and lists what was skipped or
+failed in the last run; `docs/pipeline.md` is the method write-up with references and results.
+
 ## Run it (branch `moreVids`: many videos)
 
 **On the VM, the first time.** Clone the branch into a new folder, so nothing in the old checkout (its notebook,

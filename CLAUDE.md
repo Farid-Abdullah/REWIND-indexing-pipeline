@@ -45,7 +45,8 @@ For a plumbing check without the VM's data, `REWIND_DATA_ROOT`, `REWIND_OUT_ROOT
 | `keyframes.py` | Stage 2: first / peak / change (4x4 tile pHash) / maxgap keyframes, dedup, idle heartbeat |
 | `gpu_stages.py` | From Muzayyan's v2 (LLM-written): `Models` (lazy, skip on failure), DINOv2 gate (`scan_deep`), stage 3 events, stage 4 samplers, `write_index_records` |
 | `video_utils.py`, `visualize.py` | Frame reading; plots, GIFs, tracker-box drawing |
-| `docs/pipeline.md` | Method write-up with references; keep it in sync when a step or default changes |
+| `docs/pipeline.md` | Method write-up with references and the latest batch results; keep it in sync when a step or default changes |
+| `docs/explanation.md` | Step-by-step tuning guide: every setting, its default, what raising/lowering it does, what ran / was skipped in the last run |
 | `video/`, `outputs/` | Git-ignored. Videos and results stay local. Datasets live outside the repo (`datasets.DATA_ROOT`) |
 
 The slow decode pass is cached in `outputs/batch/<dataset>/<video>/cache/scan_<hash>.npz`. Changing a scan parameter
