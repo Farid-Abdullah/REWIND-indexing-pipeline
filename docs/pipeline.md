@@ -153,7 +153,7 @@ score is the **mean of the two highest ratios**: a soft "two gates agree" vote. 
 MOG2, it is simply their average ratio.
 
 **Default gate: MOG2.** On the café ground truth, MOG2 and fused were nearly tied (section 6), and fused needs the
-deep gate's GPU pass. Change it with `GATE` in the notebook.
+deep gate's GPU pass. Change it with `"gate"` in the config cell of `pipeline.ipynb`.
 
 ### Check yourself (stage 1)
 1. Why can stage 1 afford false alarms but not misses? What does each cost downstream?
@@ -326,7 +326,8 @@ This is what the Postgres + pgvector database ingests.
 
 ### 5.1 What the code measures now (`motion_gating.gate_table`, `keyframe_hits`, `gate_agreement`)
 
-With a ground-truth CSV (`start_s,end_s[,label]`, one row per event), the notebook reports:
+For every video with labels (from the dataset annotations, section 5.2a; any `start_s,end_s[,label]` table works),
+the batch saves, and `explore.ipynb` shows:
 - per gate: **frame precision / recall / F1** (share of sampled moments correctly marked active), **event recall**
   (share of labelled events that a segment covers by more than half, or with IoU ≥ 0.3), and % of video active;
 - per keyframe set (every gate's keyframes, every sampler): the share of labelled events with **at least one
