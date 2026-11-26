@@ -14,7 +14,8 @@ well-chosen frames to expensive models (captioning, indexing) instead of every f
   Windows. Don't remove that pin.
 - Also runs on the team's Linux VM (2x L4). There, envs live on the 5T disk (`/mnt/5T_storage/envs/...`, created with
   `conda env create -p`), and pip / Hugging Face caches must not go to the nearly full root disk.
-- GPU stages: `pip install torch transformers ultralytics lap sentencepiece protobuf`. `ultralytics` installs
+- GPU stages: `pip install torch transformers accelerate ultralytics lap sentencepiece protobuf` (captions with
+  Qwen3-VL need `transformers>=4.57`). `ultralytics` installs
   `opencv-python` next to `opencv-python-headless`; having both can break `cv2`, so check `import cv2` afterwards.
 
 ## Commands
@@ -22,6 +23,8 @@ well-chosen frames to expensive models (captioning, indexing) instead of every f
 ```bash
 python datasets.py          # list MEVA / UCA videos, hours and annotations under DATA_ROOT
 python batch.py             # every stage on every video in selection.csv -> outputs/batch/ (= pipeline.ipynb)
+python batch.py --stages vlm   # only stage 5 captions (needs phase 1; uses phase 2's frames if present)
+python captions.py --mock      # stage 5 on every video folder with a fake captioner (plumbing check)
 python motion_gating.py v.mp4 && python keyframes.py v.mp4   # stages 1-2 on one video
 # notebooks: pipeline.ipynb runs the batch (no pictures), explore.ipynb shows the results; kernel "rewind (5T)" on the VM
 ```
@@ -44,6 +47,7 @@ For a plumbing check without the VM's data, `REWIND_DATA_ROOT`, `REWIND_OUT_ROOT
 | `motion_gating.py` | Stage 1: frame diff + MOG2 (colour, NCC lighting filter), adaptive threshold on the quieter half, hysteresis segments, fused gate (`add_fused`); ground-truth checks (`gate_table`, `keyframe_hits`, `gate_agreement`) |
 | `keyframes.py` | Stage 2: first / peak / change (4x4 tile pHash) / maxgap keyframes, dedup, idle heartbeat |
 | `gpu_stages.py` | From Muzayyan's v2 (LLM-written): `Models` (lazy, skip on failure), DINOv2 gate (`scan_deep`), stage 3 events, stage 4 samplers, `write_index_records` |
+| `captions.py` | Stage 5: Qwen-VL JSON captions per selected frame and per clip (segment cut into <= 60 s), resume by `settings_hash`, `MockVL`, `caption_review.csv` hand-check sheet |
 | `video_utils.py`, `visualize.py` | Frame reading; plots, GIFs, tracker-box drawing |
 | `docs/pipeline.md` | Method write-up with references and the latest batch results; keep it in sync when a step or default changes |
 | `docs/explanation.md` | Step-by-step tuning guide: every setting, its default, what raising/lowering it does, what ran / was skipped in the last run |
@@ -63,6 +67,9 @@ vote, ground-truth evaluation.
 - Hand-off: `outputs/<video>/events/index_records.jsonl` + `index_embeddings.npy` (SigLIP, 768-d for
   `siglip-base-patch16-224`), one record per keyframe of the primary sampler (`kcenter`, falls back to `phash`).
 - A model that fails to load is skipped with a warning (`models.failed`). SigLIP needs `sentencepiece`.
+- Stage 5 (`captions.py`) reads that hand-off (or stage 2's `keyframes.csv`) and writes `captions/captions.csv`.
+  Unlike `Models`, a VLM that fails to load is an error per video (`error_vlm.json`), not a silent skip. The
+  detector's events are stored next to captions but deliberately not put in the prompt (independent check).
 - Known weak spots (café video): track IDs switch in crowds, `crowd`/`loitering` fire constantly in busy scenes,
   X-CLIP's softmax over 13 prompts rarely passes `xclip_threshold` 0.35, the deep gate's first frames become its
   background (people there at the start count as change for ~1 min).

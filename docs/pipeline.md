@@ -23,7 +23,7 @@ related-work sections.
 
 A fixed camera records long stretches where little happens. Captioning or indexing every frame is slow and
 expensive, and most frames repeat the same scene. The pipeline narrows the video down in four stages, each more
-expensive than the last but running on less of the video:
+expensive than the last but running on less of the video, and then describes what is left in words (stage 5):
 
 ```
 video (25-30 frames/s)
@@ -32,8 +32,10 @@ video (25-30 frames/s)
   ├─ Stage 2  keyframes            inside segments, cheap (CPU)    → a few representative frames per segment
   ├─ GT check                      CPU                             → did segments / keyframes catch the labels?
   ├─ Stage 3  events               inside segments, 4 frames/s, GPU→ who/what is there, what happens
-  └─ Stage 4  frame selection      same candidates, GPU            → frames for the captioner + search index
-                                                                     (index_records.jsonl + embeddings)
+  ├─ Stage 4  frame selection      same candidates, GPU            → frames for the captioner + search index
+  │                                                                  (index_records.jsonl + embeddings)
+  └─ Stage 5  captions             stage 4's frames + clips, GPU   → structured text per frame and per clip
+                                                                     (captions/captions.csv)
 ```
 
 | Part | Code | Origin |
@@ -43,6 +45,7 @@ video (25-30 frames/s)
 | Stage 1 | `motion_gating.py` (+ `gpu_stages.scan_deep` for the deep gate) | v1 (Farid), with v2's threshold, colour MOG2 and fused vote |
 | Stage 2 | `keyframes.py` | v1 |
 | Stages 3, 4 | `gpu_stages.py` | v2 (Muzayyan, written with an LLM) |
+| Stage 5 (captions) | `captions.py`, phase `vlm` of `batch.py` | added 26 Nov 2026 (written with an LLM) |
 | Results views | `explore.ipynb` | added for the batch run |
 
 The batch runs stages 1-2 (and the ground-truth check) for **every video first**, then stages 3-4 for every
@@ -275,6 +278,49 @@ these records, but they can't be searched until SigLIP works.
 2. Why does "far from every kept frame" avoid repeats that "far from the last kept frame" doesn't?
 3. Why is `kcenter`'s event recall partly circular, and what should we report instead?
 
+## 4b. Stage 5: captions (`captions.py`, GPU) — code added 26 Nov, not run on the VM yet
+
+**Goal:** text a search can match ("person in a red jacket carrying a box near the door"), tied to an exact
+camera, time and clip. A vision-language model (VLM) looks at the frames stage 4 chose and writes it.
+
+**Model.** Qwen2.5-VL-7B-Instruct [20] by default (the supervisor's "small Qwen-VL"), run through Hugging Face
+`transformers`, bf16, greedy decoding (the same frame always gets the same caption). It follows the LLaVA
+template from the reading list (vision encoder → projector → LLM) and adds native dynamic resolution: an image
+becomes a variable number of 28×28-pixel tokens instead of being squashed to a fixed size, which matters for
+small, far-away people. Qwen3-VL checkpoints load through the same code (`model` setting).
+
+**Two levels.**
+
+| Level | Input | Output | Why |
+|---|---|---|---|
+| frame | one selected frame (stage 4's hand-off, or stage 2's keyframes if stage 4 hasn't run), up to ~1 MP | JSON: caption, scene, lighting, people count, people (appearance / action / where), vehicles, objects, notable, uncertain | fine-grained "who is there and what do they look like"; shares `embedding_row` with the SigLIP vector of the same frame, so text and image search can be combined per frame |
+| clip | a motion segment cut into pieces of ≤ 60 s; up to 6 frames of it in time order, each labelled "+12.3 s" | JSON: summary, actions, max people, people, vehicles, objects, notable, uncertain | actions over time (enters, picks up, leaves) that one frame can't show; a clip has a start and end, so it is what a search returns and the player jumps to |
+
+Clip frames are the stage-2/4 frames inside the clip, thinned evenly to 6; if fewer than 3 were selected, evenly
+spaced frames from the video fill it up. The 60-s cap matters for UCA, where one segment can cover the whole
+video, and keeps clips close to the length of the UCA sentences we will score with temporal IoU.
+
+**Not making things up.** Results are evidence, so the system prompt says: describe only what is clearly
+visible, never guess identities or intentions, put doubts in `uncertain`. The detector's events and objects are
+stored next to each caption but **not** shown to the VLM, so the two stay independent and can check each other
+later (the Capstone's verification step). How often the captions still mention things that aren't there is
+measured by hand: `caption_review.csv` / `.html` (60 random frames, picture next to caption, columns for
+hallucinated and missed items) and `captions.review_summary()` for the percentages.
+
+**Outputs** (`captions/`): `frame_captions.jsonl`, `clip_captions.jsonl` (full JSON + raw answer + timing),
+`captions.csv` (both levels in one table: camera, start/end, wall clock, text, `search_text`, preview image),
+`frames/*.jpg` (the frames at the size the model saw). Per video `summary_vlm.json`: counts, unparsed answers,
+seconds per frame / clip, minutes per video-hour, peak VRAM.
+
+**Cost estimate, to be measured.** The 19 Nov hand-off had 1,075 frames for 2 h of video, plus about one clip
+per segment-minute. At an assumed 1-3 s per frame on an L4 that is roughly 20-55 GPU-minutes for 2 h, which would
+make captioning the most expensive stage, as expected. Replace this paragraph with the measured numbers.
+
+### Check yourself (stage 5)
+1. Why are the detector's events not put into the prompt, even though they would make captions "better"?
+2. A clip caption says "a man picks up a bag". Which file tells you which frames it saw, and how do you check it?
+3. Why does `frame_max_pixels` matter more for MEVA than for a close-up indoor camera?
+
 ---
 
 ## 5. Evaluation and data
@@ -310,8 +356,9 @@ For every video with labels, for every gate and keyframe set:
 
 Retrieval Recall@1/5/10 at temporal IoU 0.3 and 0.5 on UCA test queries, against CLIP-only and SigLIP-only
 baselines; 50-100 of our own queries on MEVA and our footage; query latency and hours indexed per GPU-hour; how
-often the captioner mentions things that aren't there. Needs embeddings (SigLIP), then a text encoder and the
-search; the database and API come after.
+often the captioner mentions things that aren't there. Captions and the hand-check sheet for the last one exist
+now (section 4b); still missing: embeddings (SigLIP), a text encoder over `search_text`, and the search itself;
+the database and API come after.
 
 ---
 
@@ -380,6 +427,8 @@ Long activities are caught, short ones are not: `person_talks_to_person` 86 % (1
    phase: embeddings, `kcenter`, SigLIP tags.
 2. G421 15:55: the motion score is exactly 0 for the last ~50 s while labelled activity continues. Frozen frames
    or a decoding problem? Open the video and check.
+2b. Run stage 5 on the VM (`STAGES=["vlm"]`): confirm the model loads, fill in the cost estimate in section 4b,
+   and hand-check `caption_review.csv`.
 
 **To decide with experiments** (settings and expected effects: `docs/explanation.md`, "Suggested experiments")
 3. Gate: switch to `diff` or `fused`?
@@ -405,6 +454,7 @@ Long activities are caught, short ones are not: `person_talks_to_person` 86 % (1
 | 2. Keyframes | | | |
 | 3. Events | | | |
 | 4. Frame selection + hand-off | | | |
+| 4b. Captions | | | |
 | 5-6. Evaluation, data and results | | | |
 
 ---
@@ -430,3 +480,4 @@ Long activities are caught, short ones are not: `person_talks_to_person` 86 % (1
 17. T. Yuan et al., "Towards Surveillance Video-and-Language Understanding: New Dataset, Baselines, and Challenges" (UCA), *CVPR*, 2024. [arXiv:2309.13925](https://arxiv.org/abs/2309.13925)
 18. W. Sultani, C. Chen, M. Shah, "Real-world Anomaly Detection in Surveillance Videos" (UCF-Crime), *CVPR*, 2018. [arXiv:1801.04264](https://arxiv.org/abs/1801.04264)
 19. K. Corona, K. Osterdahl, R. Collins, A. Hoogs, "MEVA: A Large-Scale Multiview, Multimodal Video Dataset for Activity Detection," *WACV*, 2021. [arXiv:2012.00914](https://arxiv.org/abs/2012.00914)
+20. S. Bai et al. (Qwen Team), "Qwen2.5-VL Technical Report," 2025. [arXiv:2502.13923](https://arxiv.org/abs/2502.13923)

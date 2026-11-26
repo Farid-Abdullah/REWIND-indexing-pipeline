@@ -1,4 +1,4 @@
-# REWIND ingest: motion gating, keyframes, events
+# REWIND ingest: motion gating, keyframes, events, captions
 
 **Goal:** in a long video from a fixed camera, find *when something happens* and pick *a few frames that show it*.
 Expensive models (captioning, the search index) then only look at those frames instead of every frame.
@@ -27,15 +27,16 @@ Or from a terminal inside `tmux` (keeps running if the laptop disconnects):
 tmux new -s batch            # later: tmux attach -t batch
 conda activate <the env behind "rewind (5T)">
 python datasets.py           # what's on disk: videos, hours, annotations (quick)
-python batch.py              # both phases;  --stages cpu  = only stages 1-2
+python batch.py              # all three phases;  --stages cpu  = only stages 1-2;  --stages vlm = only captions
 ```
 
 - **Which videos:** `selection.csv`, made on the first run: ~1 h of MEVA (whole 5-min time slots of all 4 cameras,
   annotated slots first) + ~1 h of UCA `dev_videos` (spread over categories, test split first). Edit it to change
   the set, or delete it to pick again. Data paths: `DATA_ROOT` in the config cell
   (`/mnt/5T_storage/clipsExtraction/datasets`).
-- **Two phases:** stages 1-2 (CPU) for every video first, then stages 3-4 (GPU) for every video. If the GPU phase
-  breaks or takes too long, interrupt it: the CPU results are already saved and `explore.ipynb` works with them.
+- **Three phases:** stages 1-2 (CPU) for every video first, then stages 3-4 (GPU), then stage 5 (captions, GPU).
+  If a GPU phase breaks or takes too long, interrupt it: earlier results are already saved and `explore.ipynb`
+  works with them.
 - **Resume:** finished videos are skipped on a re-run (`FORCE = True` redoes them). A failing video is logged and
   skipped; its traceback is in `outputs/batch/<dataset>/<video>/error_cpu.json` (or `error_gpu.json`).
 - **Ground truth** comes from the datasets themselves (`datasets.py`): MEVA activity labels (`*.activities.yml`,
@@ -105,6 +106,21 @@ Then several **samplers** choose which of those frames go to the captioner and t
 scored side by side with stage 2's keyframes. The chosen frames are written to `events/index_records.jsonl`
 (camera, time, events, objects) + `events/index_embeddings.npy` (SigLIP, 768 numbers per frame).
 
+## Stage 5: captions (`captions.py`, GPU)
+
+A vision-language model (Qwen2.5-VL-7B by default; set `CFG["vlm"]["model"]` to another name or a local folder,
+Qwen3-VL works too) writes a JSON description of:
+- **every selected frame** (stage 4's `index_records.jsonl`, or stage 2's keyframes if stage 4 hasn't run):
+  caption, scene, lighting, people (clothes, action, where), vehicles, objects, anything unusual, what's unclear;
+- **every clip** (a motion segment cut into pieces of at most 60 s): up to 6 of its frames in time order, so it can
+  describe what *happens* (enters, picks up, leaves). A clip has a start and an end: it's what a search returns.
+
+It is told to describe only what it can see. Everything goes to `captions/captions.csv` (one row per frame or clip:
+camera, start/end, clock time, text, `search_text`, preview image). After the phase, `outputs/batch/caption_review.csv`
++ `.html` show 60 random frames next to their captions, to count by hand how often it mentions things that
+aren't there. Needs `torch transformers accelerate` (Qwen3-VL: `transformers>=4.57`) and ~16 GB of GPU memory;
+the phase-2 models are freed first. Plumbing check without a GPU: `python captions.py --mock` or `"mock": True`.
+
 Known weak spots (café video): track IDs switch in crowds, so one person can "appear" many times; `crowd` and
 `loitering` fire almost constantly in a busy lobby; X-CLIP rarely passes its threshold. The rules were written for
 outdoor CCTV and need tuning per scene.
@@ -112,7 +128,7 @@ outdoor CCTV and need tuning per scene.
 ## Outputs (`outputs/batch/<dataset>/<video name>/`)
 
 Batch-level files in `outputs/batch/`: `batch_summary.csv` (one row per video, every number below), `selection_used.csv`,
-`batch_config.json`. Per video, `summary_cpu.json` / `summary_gpu.json` hold that video's row, and `gt.csv` the
+`batch_config.json`, `caption_review.csv` / `.html` (hand check of caption quality). Per video, `summary_cpu.json` / `summary_gpu.json` hold that video's row, and `gt.csv` the
 labelled items with a `has_keyframe` column.
 
 
@@ -123,6 +139,7 @@ labelled items with a `has_keyframe` column.
 | `motion_scores.csv` | every gate's score for every analysed frame |
 | `gt.csv`, `gt_eval_gates.csv`, `gt_eval_keyframes.csv` | ground truth and how each gate / keyframe set did on it, incl. **uniform sampling with the same number of frames** and 1 frame/s as baselines (only for videos with annotations) |
 | `cache/` | the slow decode pass (and the deep gate), so re-runs are fast. Safe to delete |
+| `captions/` | stage 5: `captions.csv` (frames + clips in one table), `frame_captions.jsonl`, `clip_captions.jsonl`, `frames/` (what the model saw) |
 | `events/` | stages 3-4 (GPU): `events.csv` (merged events), `tracks.csv` + `tracks_raw.csv`, `xclip_windows.csv`, `candidate_frames.csv`, `sampling_comparison.csv`, `keyframes_<sampler>.csv` (+ JPGs in `keyframes/kcenter/`), `gifs/`, `timeline.png`, and the hand-off **`index_records.jsonl` + `index_embeddings.npy`** |
 
 ## Main knobs

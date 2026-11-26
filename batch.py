@@ -5,12 +5,15 @@ a closed laptop:
 
     python batch.py                    # selection.csv (made on first run), CPU stages then GPU stages
     python batch.py --stages cpu       # only stages 1-2
+    python batch.py --stages vlm       # only captions (needs phase 1; uses phase 2's frames if they exist)
     python batch.py --force            # redo videos that already have results
 
-Two phases, so a GPU problem can't cost you the CPU results:
+Three phases, so a GPU problem can't cost you the CPU results:
   phase 1 (CPU, every video): stage 1 motion gating -> stage 2 keyframes -> ground-truth checks
   phase 2 (GPU, every video): stage 3 events (YOLO-World + ByteTrack, SigLIP, X-CLIP) -> stage 4 frame
                                selection -> index_records.jsonl + index_embeddings.npy
+  phase 3 (VLM, every video): stage 5 captions (captions.py): one per selected frame + one per clip
+                               -> captions/captions.csv; then caption_review.csv for a hand check
 Each video is wrapped in try/except: one broken file is logged and skipped, the batch goes on.
 Finished videos are skipped on a re-run (resume), unless force=True.
 
@@ -53,6 +56,7 @@ DEFAULT_CFG = {
     "keyframes": {"metric": "phash", "change_threshold": 6.0, "dedup_threshold": 2.5,
                   "min_gap_s": 3.0, "max_gap_s": 30.0, "heartbeat_s": 300.0},
     "v2": {},                  # overrides for gpu_stages.DEFAULT_CONFIG (events, sampling, runtime ...)
+    "vlm": {},                 # overrides for captions.CAPTION_CONFIG (model, levels, batch_size, mock ...)
     "naive_fps": 1.0,          # baseline: 1 frame per second
 }
 
@@ -275,6 +279,29 @@ def run_gpu(row, cfg, models, v2) -> dict:
     return s
 
 
+# ---------------------------------------------------------------------------------------------------
+# Phase 3: VLM captions for one video (reads phase 1's files, and phase 2's if they exist)
+# ---------------------------------------------------------------------------------------------------
+def run_vlm(row, cfg, captioner, force=False) -> dict:
+    import captions as cap
+    return cap.caption_video(out_dir(cfg, row), captioner, force=force)
+
+
+def _free_gpu_models(models) -> None:
+    """Drop the phase-2 models before the VLM loads (it needs ~16 GB of the L4's 24 GB)."""
+    if models is None:
+        return
+    models._cache.clear()
+    try:
+        import gc
+        import torch
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except ImportError:
+        pass
+
+
 def _nearest_candidates(meta, kf):
     """Candidate-row index nearest to each v1 keyframe, within the same segment (heartbeats: idle rows)."""
     t, sid = meta.timestamp_s.to_numpy(), meta.segment_id.to_numpy()
@@ -295,7 +322,8 @@ def collect_summary(cfg, selection: pd.DataFrame) -> pd.DataFrame:
     for _, row in selection.iterrows():
         out = out_dir(cfg, row)
         r = {"dataset": row["dataset"], "video_id": row["video_id"]}
-        for f in ("summary_cpu.json", "summary_gpu.json", "error_cpu.json", "error_gpu.json"):
+        for f in ("summary_cpu.json", "summary_gpu.json", "summary_vlm.json",
+                  "error_cpu.json", "error_gpu.json", "error_vlm.json"):
             r.update(_read_json(out / f) or {})
         rows.append(r)
     df = pd.DataFrame(rows)
@@ -303,7 +331,7 @@ def collect_summary(cfg, selection: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def run_batch(selection: pd.DataFrame, cfg: dict | None = None, stages=("cpu", "gpu"), force=False,
+def run_batch(selection: pd.DataFrame, cfg: dict | None = None, stages=("cpu", "gpu", "vlm"), force=False,
               log=print) -> pd.DataFrame:
     cfg = merged_cfg(cfg)
     cfg["out_root"].mkdir(parents=True, exist_ok=True)
@@ -320,19 +348,31 @@ def run_batch(selection: pd.DataFrame, cfg: dict | None = None, stages=("cpu", "
         models = gs.Models(v2)
         log(f"GPU stages: device {models.device}" + ("  (MOCK MODELS)" if models.mock else ""))
 
-    for phase in [p for p in ("cpu", "gpu") if p in stages]:
+    captioner = None
+    for phase in [p for p in ("cpu", "gpu", "vlm") if p in stages]:
         log(f"\n=== phase {phase.upper()} ===")
+        if phase == "vlm":
+            import captions as cap
+            _free_gpu_models(models)
+            captioner = cap.Captioner(cfg["vlm"])
+            log(f"VLM: {captioner.model_name}" + ("  (MOCK)" if captioner.cfg["mock"] else ""))
         t_phase = time.perf_counter()
         for i, (_, row) in enumerate(selection.iterrows(), 1):
             out = out_dir(cfg, row)
             done = _read_json(out / f"summary_{phase}.json")
             tag = f"[{i}/{n}] {row['dataset']}/{row['video_id']}"
+            if phase == "vlm" and done and done.get("settings_hash") != captioner.settings_hash():
+                done = None   # other model / prompts / image size: caption again
             if done and str(done.get(f"status_{phase}", "")).startswith(("ok", "no segments")) and not force:
                 log(f"{tag}: done before, skipped")
                 continue
             t0 = time.perf_counter()
             try:
-                if phase == "cpu":
+                if phase == "vlm":
+                    s = run_vlm(row, cfg, captioner, force)
+                    msg = (f"{s['vlm_frames']} frame + {s['vlm_clips']} clip captions ({s['vlm_source']}), "
+                           f"{s['vlm_parse_failed']} unparsed")
+                elif phase == "cpu":
                     s = run_cpu(row, cfg, models)
                     msg = (f"{s['duration_s'] / 60:.1f} min, {s['active_pct']:.0f}% active, {s['keyframes']} kf "
                            f"({s['reduction_x']:.0f}x fewer)" +
@@ -351,6 +391,10 @@ def run_batch(selection: pd.DataFrame, cfg: dict | None = None, stages=("cpu", "
                 log(f"{tag}: ERROR {e!r}  (details in {out / f'error_{phase}.json'})")
             collect_summary(cfg, selection)
         log(f"phase {phase.upper()} took {(time.perf_counter() - t_phase) / 60:.1f} min")
+        if phase == "vlm":
+            sheet = cap.make_review_sheet(cfg["out_root"], cfg.get("review_n", 60))
+            if sheet:
+                log(f"caption hand-check sheet: {sheet} (+ caption_review.html)")
     return collect_summary(cfg, selection)
 
 
@@ -358,14 +402,17 @@ def main() -> None:
     ap = argparse.ArgumentParser(description="Run the pipeline on every video in selection.csv.")
     ap.add_argument("--selection", default=str(ROOT / "selection.csv"))
     ap.add_argument("--data-root", default=str(ds.DATA_ROOT))
-    ap.add_argument("--stages", nargs="+", default=["cpu", "gpu"], choices=["cpu", "gpu"])
+    ap.add_argument("--stages", nargs="+", default=["cpu", "gpu", "vlm"], choices=["cpu", "gpu", "vlm"])
     ap.add_argument("--meva-min", type=float, default=60)
     ap.add_argument("--uca-min", type=float, default=60)
     ap.add_argument("--force", action="store_true")
-    ap.add_argument("--mock-models", action="store_true", help="fake GPU models: plumbing check only")
+    ap.add_argument("--mock-models", action="store_true", help="fake GPU models + captioner: plumbing check only")
+    ap.add_argument("--vlm-model", help="captioning model: HF name or local folder (default: captions.CAPTION_CONFIG)")
     a = ap.parse_args()
     sel = ds.load_or_make_selection(a.selection, Path(a.data_root), meva_min=a.meva_min, uca_min=a.uca_min)
-    cfg = {"v2": {"runtime": {"mock_models": a.mock_models}}} if a.mock_models else {}
+    cfg = {"v2": {"runtime": {"mock_models": True}}, "vlm": {"mock": True}} if a.mock_models else {"vlm": {}}
+    if a.vlm_model:
+        cfg["vlm"]["model"] = a.vlm_model
     summ = run_batch(sel, cfg, stages=a.stages, force=a.force, log=lambda m: print(m, flush=True))
     print(f"\nsummary: {DEFAULT_CFG['out_root'] / 'batch_summary.csv'} ({len(summ)} rows)")
 
