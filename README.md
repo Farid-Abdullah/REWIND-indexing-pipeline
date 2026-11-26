@@ -2,10 +2,16 @@
 
 **Goal:** in a long video from a fixed camera, find *when something happens* and pick *a few frames that show it*.
 Expensive models (captioning, the search index) then only look at those frames instead of every frame.
-On the 30-min MEVA test video the v1 settings kept 109 keyframes instead of 1,801 (1 per second), 16.5× fewer.
+Then type a sentence and get the matching clips back.
 
-**Docs:** `docs/explanation.md` walks through every step and setting (for tuning) and lists what was skipped or
-failed in the last run; `docs/pipeline.md` is the method write-up with references and results.
+**Latest run (26 Nov 2026, Practicum pilot, one L4):** 2 h of video (1 h MEVA on 4 cameras, 1 h UCA) through all
+five stages in 43 min, about 3× faster than real time: 167 clip captions and 2,673 frames with SigLIP embeddings.
+On 218 test queries the hybrid search puts the right clip in the top 5 for 42 % of UCA queries (best baseline 27 %)
+and 79 % of MEVA activity types (33 %), but is no better than the baselines at the exact moment. Notebooks with all
+outputs: `runs/2026-11-26/`; numbers and discussion: `docs/pipeline.md` section 6.
+
+**Docs:** `docs/explanation.md` walks through every step and setting (for tuning) and lists what is open after the
+last run; `docs/pipeline.md` is the method write-up with references and results.
 
 ## Layout
 
@@ -115,10 +121,12 @@ conda env create -f environment.yml && conda activate motion-gating && pip insta
 
 **Optional gates** (config cell of `1_pipeline.ipynb`): the *deep gate* (`gpu_stages.scan_deep`) compares DINOv2 features of 14×14-pixel patches
 with a slowly learned background, 2 frames/s, GPU. The *fused gate* divides each gate's score by its own threshold and
-averages the two highest: a soft "two gates agree" vote. On the café ground truth MOG2 and fused were nearly tied, so
-MOG2 stays the default (`GATE` in the config).
+averages the two highest: a soft "two gates agree" vote. MOG2 is the default (`CFG["gate"]` in the config), but in
+the 26 Nov run frame differencing and fused caught more labelled events on both datasets (partly with more
+keyframes), so the default is up for change after a comparison at equal budget.
 
-The slow part (decoding, ~50 s) is **cached** in `outputs/<video>/cache/` after first run, so changing thresholds afterwards takes about a second.
+The slow part (decoding) is **cached** in `outputs/batch/<dataset>/<video>/cache/` (single-video runs:
+`outputs/<video>/cache/`), so changing thresholds afterwards takes about a second.
 
 ## Stage 2: keyframes (`rewind/keyframes.py`)
 
@@ -131,8 +139,9 @@ For each segment, keep:
 Then drop **near-duplicates**. Outside segments, keep one **heartbeat** frame every 5 min, so slow changes aren't missed.
 
 *How "changed enough" is measured:* a **perceptual hash** (pHash) turns an image into a 64-bit fingerprint of its rough shapes, and
-similar images get similar bits. The frame is split into 4×4 tiles with one hash each, so a few small people moving still change their
-tile. Distance = how many bits differ (*Hamming distance*).
+similar images get similar bits. The frame is split into 4×4 tiles with one hash each. Distance = how many bits differ
+(*Hamming distance*), **averaged over the 16 tiles**, so compression noise in flat areas (sky) doesn't count as change;
+the price is that one small person in one tile rarely reaches the threshold on its own.
 
 ## Stages 3-4: events and frames for the index (`rewind/gpu_stages.py`, GPU)
 
@@ -146,20 +155,26 @@ Only inside segments, 4 frames/s:
 Then several **samplers** choose which of those frames go to the captioner and the index (`kcenter` by default),
 scored side by side with stage 2's keyframes. The chosen frames are written to `events/index_records.jsonl`
 (camera, time, events, objects) + `events/index_embeddings.npy` (SigLIP, 768 numbers per frame).
+Known issue: `kcenter` starts from every event anchor without a cap, so in crowded scenes it keeps more than one frame
+per second (315 frames in 5 min on MEVA G421).
 
 ## Stage 5: captions (`rewind/captions.py`, GPU)
 
 A vision-language model (Qwen2.5-VL-7B by default; set `CFG["vlm"]["model"]` to another name or a local folder,
 Qwen3-VL works too) writes a JSON description of:
 - **every selected frame** (stage 4's `index_records.jsonl`, or stage 2's keyframes if stage 4 hasn't run):
-  caption, scene, lighting, people (clothes, action, where), vehicles, objects, anything unusual, what's unclear;
+  caption, scene, lighting, people count, people (clothes, action, where), vehicles, objects, anything unusual,
+  what's unclear;
 - **every clip** (a motion segment cut into pieces of at most 60 s): up to 6 of its frames in time order, so it can
-  describe what *happens* (enters, picks up, leaves). A clip has a start and an end: it's what a search returns.
+  describe what *happens* (enters, picks up, leaves): summary, actions, most people in one frame, short descriptions
+  of people, vehicles and objects, anything unusual, what's unclear. A clip has a start and an end: it's what a
+  search returns.
 
 It is told to describe only what it can see. Everything goes to `captions/captions.csv` (one row per frame or clip:
 camera, start/end, clock time, text, `search_text`, preview image). Clips are captioned for every video first
-(phase `vlm_clips`, ~7 s per clip on one L4), then frames (phase `vlm_frames`, ~5-10 s per frame), so an
-interrupted run still leaves every video searchable by clip. The model is loaded once for both.
+(phase `vlm_clips`, ~10 s per clip on one L4 in the 26 Nov run), then frames (phase `vlm_frames`, 3.8 s per frame at
+`batch_size=8`; captioning all 2,673 selected frames of the pilot would take ~2.8 GPU-hours, so it is optional), so
+an interrupted run still leaves every video searchable by clip. The model is loaded once for both.
 
 **Caption quality** (`rewind/caption_eval.py`, shown in `3_explore.ipynb` section 6, no re-run needed):
 - *detector cross-check* (automatic, every clip): what a caption mentions (people, vehicles, bags, ...) vs what
@@ -168,10 +183,17 @@ interrupted run still leaves every video searchable by clip. The model is loaded
   model (`bge-small`), against other videos' captions as a baseline; plus top-1 / top-5 caption-only search;
 - *hand check*: 30 random clips split over 5 people, `outputs/batch/clip_review/review_<k>.html` (frames next to
   the caption) + `review_<k>.csv` to fill in; gives the hallucination and miss rate, and how far to trust the
-  detector cross-check. Model: `VLM_MODEL` in `1_pipeline.ipynb` (the VM's local Qwen2.5-VL-7B folder); needs `torch`,
-`transformers>=4.49` and ~17 GB free on each GPU in `VLM_DEVICE`. `VLM_DEVICE = ["cuda:0", "cuda:1"]` (the default)
-runs one copy of the model per L4, each on about half the video-time, so captioning takes about half as long;
-`"cuda:0"` uses one GPU. Plumbing check without a GPU: `REWIND_MOCK=1`.
+  detector cross-check.
+
+In the 26 Nov run the two automatic checks ran: the detector cross-check flagged a likely hallucination in 15.6 % of
+MEVA and 26.2 % of UCA clip captions (a screen, not ground truth: all MEVA flags are bags). The hand check sheets are
+made but not filled in yet.
+
+**Model and GPUs:** `VLM_MODEL` in `1_pipeline.ipynb` (the VM's local Qwen2.5-VL-7B folder); needs `torch`,
+`transformers>=4.49` and ~17 GB free on each GPU in `VLM_DEVICE` (peak 19.8 GB in the run).
+`VLM_DEVICE = ["cuda:0", "cuda:1"]` (the default) runs one copy of the model per L4, each on about half the
+video-time, so captioning should take about half as long (not yet timed; the 26 Nov run used `"cuda:0"`).
+Plumbing check without a GPU: `REWIND_MOCK=1`.
 
 ## Search (`rewind/search.py`, `notebooks/2_search.ipynb`)
 
@@ -186,8 +208,10 @@ no server. Methods, all scored the same way:
 | `siglip_1fps` | baseline: SigLIP on 1 frame/s of every whole video (no gating, no captions) | frames |
 | `clip_1fps` | baseline: the same with CLIP ViT-B/32 | frames |
 
-Each result has two spans: the **clip** (up to 60 s) and a **window** of `moment_s` = 10 s around its best frame,
-because a 60-s clip can never reach IoU 0.3 with a 5-s event.
+Each result has two spans: the **clip** (up to 60 s) and a **window** of `moment_s` = 10 s around its best SigLIP
+frame (for every clip method, `captions` included; kept inside the clip; a clip of ≤ 10 s is its own window),
+because a 60-s clip can never reach IoU 0.3 with a 5-s event. Filters: dataset, video and camera
+(`SearchIndex.search`); no time-of-day filter yet, and no "nothing found" threshold (it always returns something).
 
 **Test queries** (`outputs/batch/search/queries.csv`, written from the ground truth on the first run; edit it or add
 rows): every UCA sentence of the selected UCA videos (answer: its own span) and one operator-style sentence per MEVA
@@ -202,6 +226,17 @@ lenient R@5 over reachable queries only (is the search itself good?), plus ms pe
 Outputs in `outputs/batch/search/`: `queries.csv`, `results.csv` (top 10 per query x method x setting),
 `per_query.csv` (first correct rank per query), `metrics.csv`, `latency.csv`, `demo_results.csv`, `search_run.json`,
 and `index/` (the cached baseline embeddings; delete it to re-embed). Plumbing check without models: `REWIND_MOCK=1`.
+
+**26 Nov run** (218 queries, all videos of a dataset searched, % correct in the top 5):
+
+| Method | UCA, right clip (lenient) | UCA, exact moment (IoU ≥ 0.3) | MEVA, right clip (lenient) |
+|---|---|---|---|
+| `hybrid` | **42.3** | **19.6** | **79.2** |
+| `captions` / `siglip_selected` | 32.5 / 33.0 | 14.4 / 17.0 | 62.5 / 50.0 |
+| `siglip_1fps` / `clip_1fps` (baselines) | 27.3 / 22.2 | 19.1 / 18.0 | 33.3 / 29.2 |
+
+Median 36 ms per query. Within a single known video the baselines are better at the exact moment (they have a frame
+every second). Details: `docs/pipeline.md` section 6.5.
 
 Known weak spots (café video): track IDs switch in crowds, so one person can "appear" many times; `crowd` and
 `loitering` fire almost constantly in a busy lobby; X-CLIP rarely passes its threshold. The rules were written for
@@ -232,7 +267,7 @@ labelled items with a `has_keyframe` column.
 | `k` | `SEGMENT_PARAMS` | higher = only stronger motion counts, fewer segments |
 | `q_noise` | `SEGMENT_PARAMS` | share of quietest samples that defines "normal" (0.5; 1.0 = all samples) |
 | `mog2_color` | `SCAN_PARAMS` | MOG2 on colour (True) or greyscale (False) |
-| `GATE` | notebook config (`method` in `SEGMENT_PARAMS` for the command line) | which gate feeds the later stages: `"mog2"` (default), `"diff"`, `"fused"`, `"deep"` |
+| `gate` | `CFG["gate"]` in the notebook config (`method` in `SEGMENT_PARAMS` for the command line) | which gate feeds the later stages: `"mog2"` (default), `"diff"`, `"fused"`, `"deep"` |
 | `min_gap_s` | `KEYFRAME_PARAMS` | the main control of how many keyframes you get |
 | `change_threshold` | `KEYFRAME_PARAMS` | higher = a bigger scene change is needed for a new keyframe |
 | `heartbeat_s` | `KEYFRAME_PARAMS` | how often to sample quiet periods |

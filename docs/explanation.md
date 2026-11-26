@@ -4,11 +4,17 @@ Every step that `1_pipeline.ipynb` runs, in order, with every setting, what it d
 lower it, and what it did in our first real run. Written so we can tune the pipeline on purpose instead of by
 guesswork. The method write-up with references is `docs/pipeline.md`; this file is the hands-on companion.
 
-**The run this file describes:** 19 Nov 2026, branch `moreVids` (since merged into `main`; the repository was then
-called `cctv-motion-gating`), commit `ea088de`, on the team VM (one L4 GPU
-used). 38 videos, 2.00 h of video: 12 MEVA clips (1.0 h) + 26 UCA videos (1.0 h). All default settings.
-Wall time 15.3 min (CPU phase 7.9 min, GPU phase 7.4 min). No video failed.
-Kernel "rewind (5T)" ran **Python 3.13** from `/mnt/5T_storage/clipsExtraction/tools/awsenv`, not the
+**The run this file describes:** 26 Nov 2026, the Practicum pilot, on the team VM (one L4 GPU used), from a clean
+start with no cache. 38 videos, 2.00 h of video: 12 MEVA clips (1.0 h) + 26 UCA videos (1.0 h). All default
+settings. CPU phase 7.1 min, GPU phase 8.8 min, clip captions 27.2 min (43 min in total); frame captions stopped by
+hand after 220 frames; then the search notebook (3.3 min). No video failed. The notebooks with all their outputs
+are in `runs/2026-11-26/`.
+
+An earlier run on 19 Nov (branch `moreVids`, since merged into `main`; the repository was then called
+`cctv-motion-gating`; commit `ea088de`) covered stages 1-4 only and gave the same stage 1-2 numbers. There SigLIP
+failed to load; that is fixed.
+
+Kernel "rewind (5T)" runs **Python 3.13** from `/mnt/5T_storage/clipsExtraction/tools/awsenv`, not the
 `motion-gating` conda env (3.11) described in `environment.yml`. Packages must be installed into that env.
 
 Conventions: `NAME=value` is a setting and its default. "Config" means the config cell of `1_pipeline.ipynb`
@@ -18,28 +24,30 @@ Conventions: `NAME=value` is a setting and its default. "Config" means the confi
 
 ## At a glance: what ran, what was skipped, what failed
 
-| Step | Status in the 19 Nov run | Why / what it means |
+| Step | Status in the 26 Nov run | Why / what it means |
 |---|---|---|
 | 0. Find videos, pick ~1 h per dataset, load labels | ✅ ran | 12 MEVA clips (all annotated), 26 UCA videos (all annotated) |
 | 1. Motion gating: frame differencing | ✅ ran | computed for every video, compared, but **not** the gate used downstream |
 | 1. Motion gating: MOG2 | ✅ ran, **used** | `gate="mog2"` feeds keyframes and stages 3-4 |
-| 1. Motion gating: fused vote | ✅ ran | average of diff and MOG2 (only 2 gates, so not a real "2 of N" vote) |
+| 1. Motion gating: fused vote | ✅ ran | average of diff and MOG2 ratios (only 2 gates, so not a real "2 of N" vote) |
 | 1. Motion gating: deep gate (DINOv2) | ⏭️ **off** | `deep_gate=False` by choice (a full-video GPU pass; earlier results didn't justify it) |
 | 2. Keyframes | ✅ ran | 1,037 keyframes for 2 h; JPGs saved for the MOG2 gate only |
 | Ground-truth check | ✅ ran | all 38 videos have labels |
 | 3. Detector + tracker (YOLO-World + ByteTrack) | ✅ ran | most events are `person_appears`; IDs switch a lot |
-| 3. SigLIP tags + **image embeddings** | ❌ **failed to load** | `SiglipTokenizer requires the SentencePiece library`. Fix: `pip install sentencepiece protobuf` in the awsenv, restart the kernel |
-| 3. X-CLIP clip tags | ✅ loaded and ran | in the video inspected in `3_explore.ipynb`, every event key is one the tracker rules produce; X-CLIP contributed nothing visible (check the `source` column of `events.csv`) |
-| 4. Samplers `novelty`, `kcenter`, `importance` | ⏭️ **skipped** | they need SigLIP embeddings |
-| 4. Primary sampler | ⚠️ **fell back** | `primary="kcenter"` didn't run, so the hand-off used `phash` |
-| 4. Stage-4 JPGs | ⚠️ **none written** | `export_jpgs=["kcenter"]` and kcenter didn't run |
-| 4. Hand-off `index_records.jsonl` | ⚠️ written, **without embeddings** | `index_embeddings.npy` is empty; `embedding_row` points nowhere; `siglip_tag` is empty |
-| Coverage / redundancy metrics | ⚠️ NaN | need embeddings |
-| 5. Captions (VLM) | ⏭️ **not in this run** | `captions.py` was added on 26 Nov; tested only with a fake captioner. Phases `vlm_clips`, `vlm_frames` of `1_pipeline.ipynb` |
+| 3. SigLIP tags + **image embeddings** | ✅ ran | embeddings for all 38 videos (fixed since 19 Nov: `sentencepiece` installed in the awsenv) |
+| 3. X-CLIP clip tags | ✅ loaded and ran | shares its event keys with SigLIP; check the `source` column of `events.csv` to see what it added |
+| 4. Samplers `phash`, `novelty`, `kcenter`, `importance` | ✅ ran | compared side by side in `sampling_comparison.csv` |
+| 4. Primary sampler | ✅ `kcenter` | ⚠️ keeps more than 1 frame/s in crowded scenes (anchors not capped) |
+| 4. Hand-off `index_records.jsonl` + `index_embeddings.npy` | ✅ 2,673 frames with embeddings | 1,631 MEVA, 1,042 UCA; kcenter JPGs in `events/keyframes/kcenter/` |
+| 5a. Clip captions (VLM) | ✅ ran | 167 clips, 3 answers not valid JSON, ~10 s per clip, peak 19.8 GB |
+| 5b. Frame captions (VLM) | ⚠️ **stopped by hand** | 220 of 2,673 frames (2 MEVA videos), 3.8 s per frame: all of them would take ~2.8 GPU-hours |
+| Caption checks: detector cross-check, labels | ✅ ran (`3_explore.ipynb` section 6) | likely hallucination in 15.6 % (MEVA) / 26.2 % (UCA) of clips; a screen, not ground truth |
+| Caption check: hand check | ⏳ **sheets made, not filled in** | `outputs/batch/clip_review/`, 30 clips over 5 people |
+| Search + baselines (`2_search.ipynb`) | ✅ ran | 218 queries × 5 methods; scores in `outputs/batch/search/` |
 
-So after this run we have segments, keyframes, tracks and a ground-truth check, but **no search embeddings yet**.
-Installing `sentencepiece` and re-running only the GPU phase (`STAGES=["gpu"]`, `FORCE=True`) fixes most of the
-⚠️ and ❌ rows.
+So after this run every video is searchable by clip caption and by SigLIP frame embedding, and the search has
+been scored against both baselines. What is left: the hand check, the frame-selection and caption fixes, and the
+items at the end of this file.
 
 ```
 video (25-30 frames/s)
@@ -50,7 +58,8 @@ video (25-30 frames/s)
  ├─ GT check           CPU                           → did segments / keyframes catch the labelled moments?
  ├─ 3  events          inside segments, 4 frames/s   → tracks, tags, events, importance per frame
  ├─ 4  frame selection same candidates               → frames for the captioner / index + hand-off files
- └─ 5  captions        stage 4's frames + clips       → structured text per frame and per clip (captions.csv)
+ ├─ 5  captions        stage 4's frames + clips       → structured text per frame and per clip (captions.csv)
+ └─ search             2_search.ipynb, in memory      → ranked clips, scored against the ground truth and baselines
 ```
 
 ---
@@ -100,7 +109,8 @@ skipped: same videos, reworded.)
 | `REMAKE_SELECTION` | False | `selection.csv` is reused if it exists; edit it by hand to change the set |
 
 **What it picked:** MEVA slots 15:50, 15:55 and 16:05 × 4 cameras (the 16:00 slot, where G421 is fragmented, had
-fewer annotated clips and was skipped). UCA: 2 videos from each of 13 categories, 9 s to 5.9 min long.
+fewer annotated clips and was skipped). UCA: 2 videos from each of 13 categories (12 crime categories + normal
+videos; Arrest has only one val video and is left out), 9 s to 5.9 min long.
 
 ---
 
@@ -128,7 +138,7 @@ setting in this table re-decodes, changing anything in 1.5-1.6 or stage 2 doesn'
 The same pass also stores, per sample, the fingerprints stage 2 needs (`hash_grid=4` tile hashes,
 `hist_bins=32` grey-level histogram) and the mean brightness.
 
-**In the run:** decoding + scoring took 4.5 min per hour of MEVA (≈13× faster than real time) and 2.8 min per
+**In the run:** decoding + scoring took 4.1 min per hour of MEVA (≈15× faster than real time) and 2.5 min per
 hour of UCA (lower resolution).
 
 ### 1.2 Method A: frame differencing (`MotionScorer.update`) → `score_diff`
@@ -268,9 +278,11 @@ are re-read at full resolution and saved as JPGs.
 
 A **perceptual hash** (pHash): shrink an image to 32×32, take the discrete cosine transform, keep the 8×8
 coarsest coefficients, and set 64 bits by "above the median or not". Similar images → similar bits. We split the
-frame into a **4×4 grid** (`hash_grid=4`) and hash each tile, so a person crossing one tile changes that tile's
-hash clearly. Distance = **mean number of differing bits per tile** (0-64). Rough scale from earlier tests:
-0.2 s apart ≈ 1 bit, quiet 5 s ≈ 2-3.5 bits, busy 5 s ≈ 6-8 bits.
+frame into a **4×4 grid** (`hash_grid=4`) and hash each tile. Distance = **mean number of differing bits per tile**
+over the 16 tiles (0-64). The mean is on purpose (flat tiles such as sky flip a few bits from compression noise,
+and a max would pick that up), but it divides a change in one tile by 16: a single small person crossing one tile
+rarely reaches `change_threshold=6` on its own. Rough scale from earlier tests: 0.2 s apart ≈ 1 bit, quiet 5 s ≈
+2-3.5 bits, busy 5 s ≈ 6-8 bits.
 
 `metric="hist"` switches to a grey-level histogram distance (Bhattacharyya, 0-1) that ignores *where* things are.
 
@@ -388,38 +400,39 @@ Rules on the tracks (distances in **box heights**, so they don't depend on dista
 | `crowd` | ≥ 5 people at once for ≥ 2 s | `crowd_n=5`, `crowd_min_s=2` |
 
 **In the run:** MEVA clips gave 4-391 tracks each, UCA 5-102. G421 15:55: **391 tracks** in 5 min with ~25
-people visible, and 328 of its 352 events are `person_appears`. Most "new people" are the same person getting a
-new ID after an occlusion. `crowd` 6, `person_loitering` 2, `object_left` 2. Track events are therefore a poor
-signal in crowded scenes until tracking is tuned (supervisor's plan: January).
+people visible, and 328 of its 380 events are `person_appears`. Most "new people" are the same person getting a
+new ID after an occlusion. Track events are therefore a poor signal in crowded scenes until tracking is tuned
+(supervisor's plan: January).
 
-### 3.3 E2: SigLIP frame tags + embeddings (`SigLIPEncoder`, `siglip_events`) — **FAILED TO LOAD**
+### 3.3 E2: SigLIP frame tags + embeddings (`SigLIPEncoder`, `siglip_events`) — ran
 
-Would: embed every candidate frame with `google/siglip-base-patch16-224` (768 numbers), compare it with the
-event prompt bank (12 events, 1-2 prompts each) and 4 "nothing happening" prompts; an event is on where its best
-prompt beats the best background prompt by more than `siglip_margin=1.0` logit after smoothing over
-`siglip_smooth=3` samples. **The same embeddings are the search index.**
+Embeds every candidate frame with `google/siglip-base-patch16-224` (768 numbers), compares it with the event
+prompt bank (12 events, 1-2 prompts each) and 4 "nothing happening" prompts; an event is on where its best prompt
+beats the best background prompt by more than `siglip_margin=1.0` logit after smoothing over `siglip_smooth=3`
+samples. **The same embeddings are the search index.**
 
-**In the run:** `ImportError: SiglipTokenizer requires the SentencePiece library`. No tags, no embeddings. This
-also switches off three of the four stage-4 samplers and leaves the hand-off without embeddings. It is the same
-failure as in the earlier café run.
+**In the run:** embeddings for all 38 videos. (On 19 Nov it failed with `SiglipTokenizer requires the
+SentencePiece library`; `sentencepiece` is now installed in the awsenv and the pre-flight cell checks for it.) The
+zero-shot tags over-fire in crowds: G421 15:55, a calm school foyer, got `fighting` 14 times.
 
-### 3.4 E3: X-CLIP clip tags (`XCLIPScorer`, `xclip_events`) — ran, contributed nothing visible
+### 3.4 E3: X-CLIP clip tags (`XCLIPScorer`, `xclip_events`) — ran, rarely fires
 
 8-frame clips (`xclip_frames=8`), a new clip every 1 s (`xclip_stride=4` at 4 fps), scored against the same
 event bank + "nothing is happening" with a **softmax over 13 prompts**. An event needs probability >
 `xclip_threshold=0.35` and above the background prompt.
 
-**In the run:** loaded and ran (`[05:53:50] loaded xclip on cuda`). In the video inspected in `3_explore.ipynb`
-all event keys are tracker keys. With 13 prompts sharing one softmax, 0.35 is rarely reached (also seen in the
-café run: 0 events). Options: compare against the background prompt with a margin (like SigLIP), lower the
-threshold, or drop X-CLIP.
+**In the run:** loaded and ran. On 19 Nov (without SigLIP) every event key in the video inspected was a tracker
+key; the café run gave 0 X-CLIP events too. On 26 Nov prompt-bank keys appear, but SigLIP produces the same keys,
+so check the `source` column of `events.csv` before crediting X-CLIP. With 13 prompts sharing one softmax, 0.35 is
+rarely reached. Options: compare against the background prompt with a margin (like SigLIP), lower the threshold,
+or drop X-CLIP.
 
 ### 3.5 Merging, importance, anchors (`merge_events`, `importance_curve`, `event_anchors`)
 
 - **Merge:** same source + key + segment, less than `merge_gap_s=2.0` s apart → one event (`*_appears` events
   are never merged).
 - **Support:** how many different sources (tracks / siglip / xclip) saw the same key overlapping in time.
-  With SigLIP down and X-CLIP silent, every event had support 1.
+  On 19 Nov (SigLIP down, X-CLIP silent) every event had support 1; not re-counted for 26 Nov.
 - **Importance** per candidate frame (0-1): `0.5 × clip(motion_ratio / 3, 0, 1)` where motion_ratio = MOG2 score
   / its start threshold; raised to an event's weight where an event is on (track `*_appears`: 0.8 × score;
   others: score × (0.4 + 0.2 × min(support, 3))); set to 1.0 within 0.5 s of every track start; 0 for idle
@@ -435,36 +448,49 @@ All samplers choose from the same candidates (3.1), so they are comparable.
 
 | Sampler | Rule | Settings | In the run |
 |---|---|---|---|
-| `phash` | keep a frame when its **whole-frame** 64-bit pHash differs from the last kept one by ≥ 10 bits and ≥ 1 s passed, or 30 s passed | `phash_change=10`, `min_gap_s=1.0`, `max_gap_s=30` | ✅ ran; **became the primary** |
-| `novelty` | keep a frame if its SigLIP embedding is far (cosine distance > τ) from every frame kept so far in the segment; τ = max(0.10, 90th percentile of step distances) | `novelty_tau=0.10`, `novelty_adaptive_q=0.9` | ⏭️ skipped (no embeddings) |
-| `kcenter` | start from anchors, repeatedly add the frame worst covered (85 % embedding distance + 15 % time distance), weighted by importance; stop at the budget or when every frame is within 0.06 | `kcenter_lambda_t=0.15`, `kcenter_radius=0.06` | ⏭️ skipped |
-| `importance` | spread the budget along the importance curve (dense where important), add anchors, drop near-duplicates (similarity > 0.97) | `dedup_sim=0.97` | ⏭️ skipped |
-| `v1_keyframes` | stage 2's keyframes moved to the nearest candidate frame, for comparison | — | ✅ |
+| `phash` | keep a frame when its **whole-frame** 64-bit pHash differs from the last kept one by ≥ 10 bits and ≥ 1 s passed, or 30 s passed | `phash_change=10`, `min_gap_s=1.0`, `max_gap_s=30` | 72 frames, 60 % of labels (fallback primary) |
+| `novelty` | keep a frame if its SigLIP embedding is far (cosine distance > τ) from every frame kept so far in the segment; τ = max(0.10, 90th percentile of step distances) | `novelty_tau=0.10`, `novelty_adaptive_q=0.9` | 10 frames, 29 % |
+| `kcenter` (**primary**) | start from anchors, repeatedly add the frame worst covered (85 % embedding distance + 15 % time distance), weighted by importance; stop at the budget or when every frame is within 0.06 | `kcenter_lambda_t=0.15`, `kcenter_radius=0.06` | **315 frames, 74 %** |
+| `importance` | spread the budget along the importance curve (dense where important), add anchors, drop near-duplicates (similarity > 0.97) | `dedup_sim=0.97` | 53 frames, 53 % |
+| `v1_keyframes` | stage 2's keyframes moved to the nearest candidate frame, for comparison | — | 57 frames, 57 % |
+
+("In the run" = G421 15:55, the crowded 5-min MEVA clip, 26 Nov.)
 
 Budget for `kcenter` / `importance` per segment: `round(rate_per_min × minutes × (0.5 + mean importance))`,
 clipped to [`min_per_segment=2`, `max_per_segment=40`], `rate_per_min=8`.
 
 **Metrics** (`sampling_comparison.csv`): keyframes, per minute, reduction vs 1 frame/s, coverage and redundancy
-(need embeddings → NaN in this run), event recall and track recall (against the pipeline's **own** events, so
-partly circular for samplers seeded with anchors). The fair comparison is `gt_eval_sampling.csv` (against labels).
+in SigLIP space, event recall and track recall (against the pipeline's **own** events, so partly circular for
+samplers seeded with anchors). The fair comparison is `gt_eval_sampling.csv` (against labels).
 
-**In the run (G421 15:55):** `phash` 72 frames, 60 % of labels hit; `v1_keyframes` 57 frames, 57 %. Same story as
-stage 2: a few more frames, a few more hits, no better than even spacing.
+**In the run (G421 15:55):** `kcenter` hits the most labels (74 %), but with 315 frames in 5 min: 63 per minute,
+more than 1 frame/s (0.95× "reduction"). Cause: it starts from **every** anchor, the anchors are not capped by the
+budget, and the tracker's ~390 track starts are all anchors. The other samplers stay within budget and, as in
+stage 2, are no better than even spacing. **Fix (January):** cap the anchors at the segment budget, then compare
+again at equal frame counts.
 
-**Hand-off** (`write_index_records`), for the primary sampler (`phash`, because kcenter didn't run):
+**Hand-off** (`write_index_records`), for the primary sampler (`kcenter`):
 - `events/index_records.jsonl`: one record per frame: camera, video, frame, time, **wall-clock time** (MEVA:
   from the file name), segment, importance, events at that moment, objects (track classes and counts),
-  `siglip_tag`, `embedding_row`. 1,075 records in total (290 MEVA, 785 UCA).
-- `events/index_embeddings.npy`: **empty in this run** (no SigLIP).
-- No stage-4 JPGs (only the kcenter sampler exports them).
+  `siglip_tag`, `embedding_row`. 2,673 records in total (1,631 MEVA, 1,042 UCA), against 1,037 stage-2 keyframes.
+- `events/index_embeddings.npy`: the SigLIP vector of every record (768-d, float16).
+- `kcenter`'s JPGs in `events/keyframes/kcenter/`.
 
-This is what the Postgres + pgvector database will ingest. Without embeddings it can't be searched yet.
+The search (`2_search.ipynb`) reads these files directly; the Capstone's Postgres + pgvector database will ingest
+the same records.
 
-## Stage 5: captions (`captions.py`, phases `vlm_clips` then `vlm_frames`) — not run yet
+## Stage 5: captions (`captions.py`, phases `vlm_clips` then `vlm_frames`)
 
-Added 26 Nov 2026 after the run above; tested only with a fake captioner (`REWIND_MOCK=1`), so the real model's
-quality is still unknown. A first real attempt measured ~7 s per clip and 5-10 s per frame (batch 4) on one L4.
 Method and reasons: `docs/pipeline.md` section 4b.
+
+**In the run (one L4, `VLM_DEVICE="cuda:0"`, Qwen2.5-VL-7B):** clip captions for all 167 clips (64 MEVA,
+103 UCA) in 27.2 min: 10.9 s per clip on MEVA, 8.8 s on UCA, i.e. 12.0 and 14.4 min per video-hour; 3 answers
+were not valid JSON (kept as text); peak 19.8 GB of the L4's 24 GB. Frame captions: 3.8 s per frame at
+`batch_size=8`; stopped by hand after 220 of 2,673 frames (two MEVA videos), since all of them would take ~2.8
+GPU-hours. Four clips were flagged `notable`, all correct (two fights, a dust cloud, an explosion flash), but only
+4 of the 24 crime / accident videos got a flag. One crowded G421 clip lists the same two jacket descriptions 19
+times: the clip prompt needs a repetition penalty and list limits (the frame prompt already caps people and
+vehicles at 6).
 
 **What it does:** phase `vlm_clips` goes over every video and makes one VLM call per clip (≤ 6 frames in time
 order); then phase `vlm_frames` goes over every video again and makes one call per selected frame (`batch_size`
@@ -485,11 +511,12 @@ isn't valid JSON is kept as plain text (`parse_ok=False`) so the frame stays sea
 | `clip_max_s` | 60 s | fewer, longer clips; coarser timestamps | more clips, finer timestamps, more calls |
 | `batch_size` | 8 in `1_pipeline.ipynb` (4 in the code) | faster per frame if VRAM allows | 4 or 2 if CUDA runs out of memory |
 | `max_new_tokens_frame` / `_clip` | 400 / 500 | fewer cut-off JSON answers in busy scenes | faster |
-| `review_n` (top level of `CFG`) | 60 | tighter hallucination estimate | quicker hand check |
+| `review_n` (top level of `CFG`) | 60 | more frames in the frame-caption sheet `caption_review.csv` | quicker check |
 
 Also in the config cell: `VLM_MODEL` (local Qwen folder on the VM), `VLM_DEVICE` and `STAGES` (drop
 `"vlm_frames"` to skip the slow part). `VLM_DEVICE = ["cuda:0", "cuda:1"]` (default) starts one worker process per
-L4, each with its own copy of the model (~17 GB each) and about half the video-time: about 2x faster. Log lines are
+L4, each with its own copy of the model (~17 GB each) and about half the video-time: about 2x faster (not yet
+timed; the 26 Nov run used one GPU). Log lines are
 tagged `[cuda:0]` / `[cuda:1]`. Use a single `"cuda:0"` or `"cuda:1"` when the other group needs a card; the
 pre-flight cell shows each card's free memory. Each phase loads the model again in its workers (~1 min).
 Changing any caption setting except `batch_size` makes `settings_hash` change, and that video's captions are made
@@ -498,8 +525,14 @@ again. Same settings → only missing clips / frames are captioned (`FRESH_RUN =
 **What to look at after a run:** `3_explore.ipynb` section 5 (one video's clips next to their frames and the labels
 of the same span) and section 6 (unparsed answers, s per clip / frame, estimated VLM minutes per video-hour, clips
 flagged as unusual), then the three quality checks: detector cross-check, captions vs labels, and the hand check
-(`outputs/batch/clip_review/review_<k>.html` + `.csv`, 30 clips over 5 people; re-run the last cell of section 6 for
-the hallucination and miss rate).
+(`outputs/batch/clip_review/review_<k>.html` + `.csv`, 30 clips over 5 people, `REVIEW_CLIPS` in `3_explore.ipynb`;
+re-run the last cell of section 6 for the hallucination and miss rate).
+
+**Caption checks in the run (automatic ones):** the detector cross-check flagged a likely hallucination in 15.6 %
+of MEVA and 26.2 % of UCA clips and a likely miss in 43.8 % / 28.2 %; the people count was within ±25 % of the
+detector for 59.7 % / 85.3 %. All ten MEVA flags are bags, which the detector may simply have missed, so read it
+as a screen. Against the labels, the covering clip's caption beats other videos' captions for 64 % of MEVA labels
+and 83 % of UCA sentences. The hand check sheets exist but haven't been filled in.
 
 ---
 
@@ -520,9 +553,29 @@ and writes the scores to `outputs/batch/search/`. `3_explore.ipynb` section 8 sh
 | `text_model` | `BAAI/bge-small-en-v1.5` | (bge-base / -large: better text match, slower) | TF-IDF fallback if it can't load |
 | `siglip_model` | `google/siglip-base-patch16-224` | must be the model stage 3 used, or the query and frame vectors don't match (checked) | |
 
+Filters: `dataset`, `video_id`, `camera_id` (`SearchIndex.search`). No time-of-day filter yet. The 10-s window is
+placed around the clip's best **SigLIP** frame for every clip method (also `captions`) and kept inside the clip;
+clips of ≤ 10 s are their own window.
+
 **What to look at:** reachable % first (the gating ceiling), then lenient R@5 (does the operator land in the right
 clip?), then R@5 IoU 0.3 (is the moment exact?); `hybrid` vs the two 1 frame/s baselines tells whether the pipeline
 helps; "where are the misses" splits failures into gating and search.
+
+**In the run (218 queries: 194 UCA sentences, 24 MEVA activity types; corpus setting):**
+
+| | UCA R@5 IoU 0.3 | UCA R@5 lenient | UCA own video R@5 IoU 0.3 | MEVA R@5 lenient |
+|---|---|---|---|---|
+| captions | 14.4 | 32.5 | 35.1 | 62.5 |
+| siglip_selected | 17.0 | 33.0 | 40.7 | 50.0 |
+| **hybrid** | **19.6** | **42.3** | 35.1 | **79.2** |
+| siglip_1fps | 19.1 | 27.3 | 44.8 | 33.3 |
+| clip_1fps | 18.0 | 22.2 | 47.9 | 29.2 |
+
+Reachable: UCA 88.7 %, MEVA 95.8 %. Hybrid lands in the right clip far more often than the baselines but is no
+better at the exact moment, and worse within one video, where the baselines have a frame every second. UCA misses
+(hybrid): 11 % gating, 46 % search. Median 36 ms per query; index 6 s, baselines 3.2 min (cached in
+`search/index/`). Unrelated operator queries still return a clip: there is no "nothing found" threshold yet.
+Full table and discussion: `docs/pipeline.md` section 6.5.
 
 ---
 
@@ -554,34 +607,45 @@ Batch level (`outputs/batch/`): `batch_summary.csv`, `selection_used.csv`, `batc
 
 ## Speed (hours of video per compute hour)
 
-| | CPU stages 1-2 | GPU stages 3-4 |
-|---|---|---|
-| MEVA | 4.9 min per video-hour (12× real time) | 4.0 min per video-hour (15× real time) |
-| UCA | 2.9 min per video-hour (21× real time) | 3.2 min per video-hour (19× real time) |
+Minutes of compute per hour of video, 26 Nov run (one L4; `3_explore.ipynb` section 7):
 
-Stage 3 is almost all of the GPU time (stage 4 < 2 s per hour). These numbers are **without** SigLIP (which
-will add time once it loads) and **without** any captioning, which will be the expensive step.
+| | CPU stages 1-2 | GPU stages 3-4 (with SigLIP) | Clip captions | **All, with clip captions** | Frame captions (if all) |
+|---|---|---|---|---|---|
+| MEVA | 4.4 (14×) | 4.9 (12×) | 12.0 (5×) | **21.3 (2.8×)** | ~103 (0.6×) |
+| UCA | 2.7 (22×) | 3.6 (17×) | 14.4 (4×) | **20.7 (2.9×)** | ~66 (0.9×) |
+
+Stage 3 is almost all of the GPU stages (stage 4 < 1 min per hour). Captioning is 56-70 % of the total, so the
+two-GPU captioning (implemented, not yet timed) is the main lever for the 4× target. Frame captions at 3.8 s per
+frame for the 2,673 hand-off frames would take ~2.8 GPU-hours for 2 h of video, slower than real time; they stay
+optional.
 
 ---
 
 ## Everything that was skipped, failed or needs checking
 
-1. ❌ **SigLIP didn't load** (missing `sentencepiece`): no search embeddings, no SigLIP tags, 3 of 4 samplers
-   skipped, hand-off without embeddings, coverage metrics NaN. Fix: `pip install sentencepiece protobuf` in
-   `/mnt/5T_storage/clipsExtraction/tools/awsenv`, restart the kernel, run with `STAGES=["gpu"]`, `FORCE=True`.
-2. ⚠️ **Primary sampler fell back** from `kcenter` to `phash`; **no stage-4 JPGs** were written.
-3. ⚠️ **X-CLIP** ran but no X-CLIP events are visible; its softmax threshold is likely never met.
-4. ⏭️ **Deep gate off** (by choice).
-5. ⚠️ **Keyframes don't beat evenly spaced frames** at the same budget (48.8 vs 49.6 % MEVA, 80.9 vs 93.8 % UCA).
-6. ⚠️ **Busy scenes:** the adaptive threshold rises to ~4.7 % of pixels in G421, so crowds count as inactive.
-7. ⚠️ **Lighting filter** removes some real people near bright windows.
-8. ⚠️ **Tracking:** ~390 IDs for ~25 people in 5 min; `person_appears` dominates the events.
-9. 🔍 **Check:** G421 15:55, score exactly 0 for the last ~50 s with a crowd present (frozen frames?).
-10. 🔍 **Environment:** the notebook ran in Python 3.13 (`awsenv`), not the `motion-gating` env. Fine, but install
-    GPU packages there and note it in the README.
-11. ⏭️ UCA `prefer_split="test"` had no effect (all dev videos are `val`).
-12. Harmless warnings in the log: `torch.jit.load is deprecated`, `IProgress not found`, X-CLIP config
-    `bos_token_id/eos_token_id` messages.
+Fixed since 19 Nov: SigLIP loads (`sentencepiece`), so every video has embeddings, all samplers run and
+`kcenter` is the primary again with its JPGs; captions and search ran.
+
+1. ⏳ **Caption hand check** not filled in yet (`outputs/batch/clip_review/`, 30 clips over 5 people).
+2. ⚠️ **`kcenter` floods crowded scenes:** 315 frames in 5 min on G421 15:55 (anchors not capped by the budget).
+3. ⚠️ **Clip captions loop** in crowds (one lists the same descriptions 19 times): repetition penalty and list
+   limits needed in the clip prompt.
+4. ⚠️ **Frame captions stopped by hand** (220 of 2,673): ~2.8 GPU-hours for all of them.
+5. ⚠️ **Two-GPU captioning not timed** (the run used `"cuda:0"`).
+6. ⚠️ **Search:** no "nothing found" threshold; no better than the baselines at the exact moment (IoU).
+7. ⚠️ **Keyframes don't beat evenly spaced frames** at the same budget (48.8 vs 49.6 % MEVA, 80.9 vs 93.8 % UCA).
+8. ⚠️ **Busy scenes:** the adaptive threshold rises to ~4.7 % of pixels in G421, so crowds count as inactive.
+9. ⚠️ **Lighting filter** removes some real people near bright windows.
+10. ⚠️ **Tracking:** ~390 IDs for ~25 people in 5 min; `person_appears` dominates the events. The zero-shot tags
+    say `fighting` 14 times in a calm foyer.
+11. ⚠️ **X-CLIP:** its softmax threshold is rarely met; check `events.csv` `source` for what it adds.
+12. ⏭️ **Deep gate off** (by choice).
+13. 🔍 **Check:** G421 15:55, score exactly 0 for the last ~50 s with a crowd present (frozen frames?).
+14. 🔍 **Environment:** the notebooks run in Python 3.13 (`awsenv`), not the `motion-gating` env; GPU packages
+    (incl. `sentencepiece`) are installed there, and the pre-flight cell checks them.
+15. ⏭️ UCA `prefer_split="test"` had no effect (all dev videos are `val`).
+16. Harmless warnings in the log: `torch.jit.load is deprecated`, `IProgress not found`, `Can't initialize NVML`,
+    X-CLIP / SigLIP config `bos_token_id/eos_token_id` messages.
 
 ---
 
@@ -591,14 +655,15 @@ Each is a config change + re-run. Compare in `3_explore.ipynb` sections 1 and 3 
 
 | # | Change | Expected effect | Re-runs |
 |---|---|---|---|
-| 1 | install `sentencepiece`, `STAGES=["gpu"]`, `FORCE=True` | embeddings, kcenter primary, SigLIP tags | GPU phase only (~7 min) |
-| 2 | `gate="diff"` (or `"fused"`) | +2 to +7 points of labels hit (from 1.7) | segments + keyframes only (scan is cached) |
+| 1 | `VLM_DEVICE = ["cuda:0", "cuda:1"]`, `STAGES=["vlm_clips"]`, `FORCE=True` | clip captions in about half the time; does the total reach 4× real time? | clip captions only |
+| 2 | `gate="diff"` (or `"fused"`) | +2 to +7 points of labels hit (from 1.7), partly from more keyframes | segments + keyframes only (scan is cached) |
 | 3 | keyframes `min_gap_s=1.0` | more frames, closer to the 1 frame/s ceiling; check it beats even spacing | keyframes only |
-| 4 | `q_noise=0.2` or `k=2.0` | busy scenes get segments where crowds move | segments + keyframes |
-| 5 | `mog2_illum_ncc=0.8` / `None` | fewer real people removed near windows | full scan (re-decode) |
-| 6 | X-CLIP: margin over background instead of 0.35 | X-CLIP events appear (or decide to drop it) | GPU phase |
-| 7 | `FRESH_RUN=False`, `STAGES=["vlm_clips"]` | captions for every clip, s/clip, VRAM; then the hand check | clip captions only |
-| 8 | `CFG["vlm"]["model"]` = a 3B model, compare the review sheet | speed vs caption quality | VLM phase only |
+| 4 | cap `kcenter`'s anchors at the budget (code change in `gpu_stages.sample_kcenter`) | stage 4 stays within budget in crowds; compare labels hit at equal counts | GPU phase |
+| 5 | `q_noise=0.2` or `k=2.0` | busy scenes get segments where crowds move | segments + keyframes |
+| 6 | `mog2_illum_ncc=0.8` / `None` | fewer real people removed near windows | full scan (re-decode) |
+| 7 | X-CLIP: margin over background instead of 0.35 | X-CLIP events appear (or decide to drop it) | GPU phase |
+| 8 | `CFG["vlm"]["model"]` = a 3B model, compare the hand-check sheets | speed vs caption quality | VLM phase only |
+| 9 | search: `moment_s` 5 / 15 s | does a shorter or longer window raise IoU-based recall? | `2_search.ipynb` only (seconds) |
 
 Changing a stage-1 scan setting (1.1-1.3 tables) re-decodes every video (≈8 min for 2 h); changing thresholds,
 segments, keyframes or the gate reuses the cache. Use `FORCE=True` either way, otherwise finished videos are

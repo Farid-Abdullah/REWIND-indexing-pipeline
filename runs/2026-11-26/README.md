@@ -4,8 +4,8 @@
 on the VM (one L4, Qwen2.5-VL-7B-Instruct, `selection.csv` = 12 MEVA videos (1.0 h) + 26 UCA val videos (1.0 h)).
 They were run before the repository was reorganised, so their import lines (`import batch`, `import search`, ...)
 are the old ones, and the paths in their outputs show the VM folder under the repository's old name
-(`/mnt/5T_storage/cctv-motion-gating`; the repository is now `REWIND-indexing-pipeline`). The clean, runnable versions are `notebooks/1_pipeline.ipynb`, `2_search.ipynb` and
-`3_explore.ipynb`.
+(`/mnt/5T_storage/cctv-motion-gating`; the repository is now `REWIND-indexing-pipeline`). The clean, runnable
+versions are `notebooks/1_pipeline.ipynb`, `2_search.ipynb` and `3_explore.ipynb`.
 
 ## What ran
 
@@ -43,7 +43,9 @@ so roughly 3 hours of video per compute-hour.
    length and de-duplication.
 4. **Details that may be invented:** e.g. "a purple jacket with a number 14", which can't be confirmed at this
    resolution. That's what the hand check is for.
-5. **No hand-check sheet yet:** it samples frame captions, and the frame phase was stopped.
+5. **Hand check not done yet:** `explore_run.ipynb` made the clip sheets (`outputs/batch/clip_review/`, 30 clips
+   over 5 people), but nobody has filled them in. The two automatic checks did run: likely hallucination in 15.6 %
+   of MEVA and 26.2 % of UCA clip captions (detector cross-check; all MEVA flags are bags, so it is a screen).
 6. **Recall of the "notable" field is low:** 4 of the 24 non-normal UCA videos were flagged (no arson, robbery,
    shooting, shoplifting, stealing or vandalism clip was).
 
