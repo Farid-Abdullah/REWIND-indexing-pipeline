@@ -40,13 +40,13 @@ video (25-30 frames/s)
 
 | Part | Code | Origin |
 |---|---|---|
-| Dataset discovery, selection, labels | `datasets.py` | added for the batch run |
-| Batch loop (phases cpu → gpu → vlm_clips → vlm_frames, pre-flight check, fresh start, resume, per-video errors) | `batch.py`, `pipeline.ipynb` | added for the batch run |
+| Dataset discovery, selection, labels | `rewind/data.py` | added for the batch run |
+| Batch loop (phases cpu → gpu → vlm_clips → vlm_frames, pre-flight check, fresh start, resume, per-video errors) | `batch.py`, `1_pipeline.ipynb` | added for the batch run |
 | Stage 1 | `motion_gating.py` (+ `gpu_stages.scan_deep` for the deep gate) | v1 (Farid), with v2's threshold, colour MOG2 and fused vote |
 | Stage 2 | `keyframes.py` | v1 |
 | Stages 3, 4 | `gpu_stages.py` | v2 (Muzayyan, written with an LLM) |
 | Stage 5 (captions) | `captions.py`, phases `vlm_clips` / `vlm_frames` | added 26 Nov 2026 (written with an LLM) |
-| Results views | `explore.ipynb` | added for the batch run |
+| Results views | `3_explore.ipynb` | added for the batch run |
 
 The batch runs stages 1-2 (and the ground-truth check) for **every video first**, then stages 3-4 for every
 video, so a GPU problem never costs the CPU results.
@@ -108,7 +108,7 @@ Our own heuristic on standard NCC, not from a paper. On the earlier 30-min MEVA 
 alarm from 9.3 % to 0.3 % of pixels.
 
 **Run:** on the crowded indoor camera G421 some blobs on real people near the bright window were removed
-(shown yellow in `explore.ipynb`). Flat, low-texture regions correlate easily with the background, so the
+(shown yellow in `3_explore.ipynb`). Flat, low-texture regions correlate easily with the background, so the
 filter can remove real people. On synthetic videos with flat-coloured moving blocks it removed them entirely.
 
 ### 1.6 Score and adaptive threshold (`robust_threshold`, `start_stop_thresholds`)
@@ -304,7 +304,7 @@ video, and keeps clips close to the length of the UCA sentences we will score wi
 visible, never guess identities or intentions, put doubts in `uncertain`. The detector's events and objects are
 stored next to each caption but **not** shown to the VLM, so the two stay independent and can check each other
 later (the Capstone's verification step). How often the captions still mention things that aren't there is
-measured in three ways (`caption_eval.py`, `explore.ipynb` section 6): by hand on 30 random clips split over 5
+measured in three ways (`caption_eval.py`, `3_explore.ipynb` section 6): by hand on 30 random clips split over 5
 people (hallucination and miss rate); automatically on every clip against the detector's tracks (mentioned but
 never tracked / tracked but not mentioned, people count); and against the ground-truth labels (sentence-embedding
 similarity to the UCA sentence of the same seconds, against other videos' captions as a baseline).
@@ -317,7 +317,7 @@ seconds per frame / clip, minutes per video-hour, peak VRAM.
 **Cost, first measurement (26 Nov, one L4, batch 4, not yet a full run).** ~7 s per clip and 5-10 s per frame.
 The 19 Nov hand-off had ~1,075 frames for 2 h of video: captioning every frame would take 1.5-3 GPU-hours, slower
 than real time, while clips (about one per segment-minute) take a fraction of that. That is why clips run first
-and frames are optional. Replace with the numbers of a full run (`explore.ipynb` section 6).
+and frames are optional. Replace with the numbers of a full run (`3_explore.ipynb` section 6).
 
 ### Check yourself (stage 5)
 1. Why are the detector's events not put into the prompt, even though they would make captions "better"?
@@ -326,7 +326,7 @@ and frames are optional. Replace with the numbers of a full run (`explore.ipynb`
 
 ---
 
-## 4c. Search (`search.py`, `search.ipynb`) — code added 26 Nov, not run on the VM yet
+## 4c. Search (`search.py`, `2_search.ipynb`) — code added 26 Nov, not run on the VM yet
 
 **Goal:** a typed sentence returns ranked moments (video, camera, start-end, best frame), and a fair score for it.
 Everything is kept in memory (≈ 2 h of video = a few thousand vectors), so no vector database or server is needed
@@ -379,7 +379,7 @@ For every video with labels, for every gate and keyframe set:
 | UCF-Crime | the underlying videos, 13 anomaly types | (via UCA) | [18] |
 | MEVA | multi-camera, untrimmed footage of an access-controlled site, scripted and spontaneous activity; activity labels, no text queries | 82 clips, 5.7 h, 4 cameras at one school site on 2018-03-13; 61 have activity labels | [19] |
 
-**How labels are used (`datasets.py`).**
+**How labels are used (`rewind/data.py`).**
 - **MEVA** `*.activities.yml` (KPF): one activity per line with a frame range; seconds = frame / fps. Only ~37
   activity types are labelled, so unlabelled motion is not an error: the labels say "these moments must be
   caught". Files are matched to videos by name without the `.r13` suffix.
@@ -391,8 +391,8 @@ For every video with labels, for every gate and keyframe set:
 ### 5.3 What the supervisor asked for
 
 Retrieval Recall@1/5/10 at temporal IoU 0.3 and 0.5 on UCA queries, against CLIP-only and SigLIP-only baselines
-(section 4c, `search.ipynb`; on UCA **val** videos, test kept for final numbers); our own queries on MEVA (one per
-activity type + 20 free-text); query latency (4c) and hours indexed per GPU-hour (`explore.ipynb` section 7); how
+(section 4c, `2_search.ipynb`; on UCA **val** videos, test kept for final numbers); our own queries on MEVA (one per
+activity type + 20 free-text); query latency (4c) and hours indexed per GPU-hour (`3_explore.ipynb` section 7); how
 often the captioner mentions things that aren't there (section 4b, hand check). Still missing: the database, the
 API, the dashboard, and an LLM layer that rewrites queries (time and camera filters exist in `search()`).
 
@@ -463,9 +463,9 @@ Long activities are caught, short ones are not: `person_talks_to_person` 86 % (1
    phase: embeddings, `kcenter`, SigLIP tags.
 2. G421 15:55: the motion score is exactly 0 for the last ~50 s while labelled activity continues. Frozen frames
    or a decoding problem? Open the video and check.
-2b. Run stage 5 on the VM (`pipeline.ipynb`, phases `vlm_clips`, `vlm_frames`): fill in the cost estimate in
+2b. Run stage 5 on the VM (`1_pipeline.ipynb`, phases `vlm_clips`, `vlm_frames`): fill in the cost estimate in
    section 4b (first attempt: ~7 s per clip, 5-10 s per frame on one L4) and do the clip hand check
-   (`explore.ipynb` section 6).
+   (`3_explore.ipynb` section 6).
 
 **To decide with experiments** (settings and expected effects: `docs/explanation.md`, "Suggested experiments")
 3. Gate: switch to `diff` or `fused`?

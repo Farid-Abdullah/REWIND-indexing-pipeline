@@ -1,10 +1,10 @@
-"""Run the pipeline on many videos and save everything to disk (no pictures; explore.ipynb shows them).
+"""Run the pipeline on many videos and save everything to disk (no pictures; 3_explore.ipynb shows them).
 
-Main way to run it: pipeline.ipynb (config cell, then Run All). The same functions also run from a terminal:
+Main way to run it: 1_pipeline.ipynb (config cell, then Run All). The same functions also run from a terminal:
 
-    python batch.py --fresh            # delete old results, then every phase on selection.csv
-    python batch.py --stages cpu       # only stages 1-2
-    python batch.py --stages vlm       # only captions (needs phase 1; uses phase 2's frames if they exist)
+    python -m rewind.batch --fresh            # delete old results, then every phase on selection.csv
+    python -m rewind.batch --stages cpu       # only stages 1-2
+    python -m rewind.batch --stages vlm       # only captions (needs phase 1; uses phase 2's frames if they exist)
 
 Phases, in this order, each over every video, so a later problem can't cost you earlier results:
   cpu         stage 1 motion gating -> stage 2 keyframes -> ground-truth checks
@@ -33,16 +33,15 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-import datasets as ds
-import keyframes as kfx
-import motion_gating as mg
-from video_utils import format_hms, video_info
+from rewind import data as ds
+from rewind import keyframes as kfx
+from rewind import motion_gating as mg
+from rewind.utils.video_utils import format_hms, video_info
+from rewind import paths
 
-ROOT = Path(__file__).resolve().parent
-
-# Same defaults as the single-video pipeline (motion_gating.SCAN_PARAMS etc.); pipeline.ipynb overrides them.
+# Same defaults as the single-video pipeline (motion_gating.SCAN_PARAMS etc.); 1_pipeline.ipynb overrides them.
 DEFAULT_CFG = {
-    "out_root": ROOT / "outputs" / "batch",
+    "out_root": paths.BATCH,
     "gate": "mog2",            # gate that feeds keyframes and stages 3-4: "mog2" | "diff" | "fused" | "deep"
     "deep_gate": False,        # DINOv2 gate: a GPU pass over the whole video. Off: docs/pipeline.md found it not worth it
     "scan": {k: v for k, v in mg.SCAN_PARAMS.items()},
@@ -121,7 +120,7 @@ def run_cpu(row, cfg, models=None) -> dict:
 
     gates = list(cfg["segments"]["gates"])
     if cfg["deep_gate"] and models is not None:
-        import gpu_stages as gs
+        from rewind import gpu_stages as gs
         t0 = time.perf_counter()
         v2 = gs.deep_update(gs.DEFAULT_CONFIG, cfg["v2"])
         deep, _ = gs.scan_deep(video, scores, v2, models, cache_dir=out / "cache")
@@ -154,7 +153,7 @@ def run_cpu(row, cfg, models=None) -> dict:
          "keyframes": len(kf), "keyframes_heartbeat": int((kf.segment_id < 0).sum()),
          "naive_frames": naive, "reduction_x": naive / max(1, len(kf)),
          "from_cache": st["from_cache"], **T}
-    for m, r in results.items():  # every gate, for comparison in explore.ipynb
+    for m, r in results.items():  # every gate, for comparison in 3_explore.ipynb
         s[f"active_pct_{m}"] = 100 * mg.active_fraction(r["segments"], D)
         s[f"keyframes_{m}"] = len(KF[m])
 
@@ -172,7 +171,7 @@ def run_cpu(row, cfg, models=None) -> dict:
         g_tab.to_csv(out / "gt_eval_gates.csv")
         k_tab.to_csv(out / "gt_eval_keyframes.csv")
         hit = np.array([bool(np.any((kf.timestamp_s >= a) & (kf.timestamp_s <= b))) for a, b in zip(gt.start_s, gt.end_s)])
-        gt.assign(has_keyframe=hit).to_csv(out / "gt.csv", index=False)   # explore.ipynb shows the misses
+        gt.assign(has_keyframe=hit).to_csv(out / "gt.csv", index=False)   # 3_explore.ipynb shows the misses
         s["gt_event_recall"] = float(g_tab.loc[gate, "event_recall"])
         s["gt_frame_recall"] = float(g_tab.loc[gate, "frame_recall"])
         s["gt_frame_precision"] = float(g_tab.loc[gate, "frame_precision"])
@@ -189,7 +188,7 @@ def run_cpu(row, cfg, models=None) -> dict:
 # Phase 2: GPU stages for one video (reads phase 1's files)
 # ---------------------------------------------------------------------------------------------------
 def run_gpu(row, cfg, models, v2) -> dict:
-    import gpu_stages as gs
+    from rewind import gpu_stages as gs
     video, out = Path(row["path"]), out_dir(cfg, row)
     s1 = _read_json(out / "summary_cpu.json")
     if not s1 or s1.get("status_cpu") != "ok":
@@ -263,7 +262,7 @@ def run_gpu(row, cfg, models, v2) -> dict:
         if len(gt):
             mg.keyframe_hits(gt, {n: mt[np.array(k, int)] for n, k in keeps.items()}).to_csv(ev_out / "gt_eval_sampling.csv")
     s["stage4_s"] = time.perf_counter() - t0
-    try:  # a picture for explore.ipynb; never fail the batch over it
+    try:  # a picture for 3_explore.ipynb; never fail the batch over it
         gate_res = {gate: {"col": f"score_{gate}", "start": s1["threshold_start"], "segments": segments}}
         gs.plot_timeline(ev_out / "timeline.png", scores, gate_res, gate, events,
                          {n: mt[np.array(k, int)] for n, k in keeps.items()}, info)
@@ -285,13 +284,13 @@ VLM_PHASES = {"vlm_clips": ["clips"], "vlm_frames": ["frames"]}   # "vlm" = both
 
 
 def run_vlm(row, cfg, captioner, levels, force=False) -> dict:
-    import captions as cap
+    from rewind import captions as cap
     return cap.caption_video(out_dir(cfg, row), captioner, force=force, levels=levels)
 
 
 def vlm_devices(cfg) -> list:
     """CFG["vlm"]["device"] as a list: "cuda:0" -> ["cuda:0"], ["cuda:0", "cuda:1"] stays."""
-    import captions as cap
+    from rewind import captions as cap
     dev = {**cap.CAPTION_CONFIG, **cfg.get("vlm", {})}["device"]
     return list(dev) if isinstance(dev, (list, tuple)) else [dev]
 
@@ -328,7 +327,7 @@ def caption_one(row, cfg, captioner, phase, force, tag, log) -> None:
 def _vlm_worker(name, device, jobs, cfg, phase, force, queue) -> None:
     """Runs in its own process: one VLM on `device`, captions its share of the videos, sends log lines back."""
     try:
-        import captions as cap
+        from rewind import captions as cap
 
         def log(msg):
             queue.put(("log", f"[{name}] {msg}"))
@@ -435,7 +434,7 @@ def clean_outputs(out_root, keep_decode_cache: bool = False, log=print) -> None:
     out_root = Path(out_root).resolve()
     if not out_root.exists():
         return
-    if out_root == Path(out_root.anchor) or out_root == Path.home().resolve() or out_root == ROOT:
+    if out_root == Path(out_root.anchor) or out_root == Path.home().resolve() or out_root == paths.REPO:
         raise ValueError(f"refusing to clean {out_root}")
     n = 0
     for child in out_root.iterdir():
@@ -499,14 +498,14 @@ def run_batch(selection: pd.DataFrame, cfg: dict | None = None, stages=("cpu", "
     selection.to_csv(cfg["out_root"] / "selection_used.csv", index=False)
     old = _read_json(cfg["out_root"] / "batch_config.json") or {}
     ran = sorted(set(old.get("stages", [])) | set(phases), key=lambda p: PHASES.index(p) if p in PHASES else 99)
-    _write_json(cfg["out_root"] / "batch_config.json", {**cfg, "stages": ran})   # explore.ipynb reads it
+    _write_json(cfg["out_root"] / "batch_config.json", {**cfg, "stages": ran})   # 3_explore.ipynb reads it
     n = len(selection)
     total_h = selection.duration_s.astype(float).sum() / 3600
     log(f"{n} videos, {total_h:.2f} h of video -> {cfg['out_root']}  (phases: {', '.join(phases)})")
 
     models = v2 = None
     if "gpu" in phases or ("cpu" in phases and cfg["deep_gate"]):
-        import gpu_stages as gs
+        from rewind import gpu_stages as gs
         v2 = gs.deep_update(gs.DEFAULT_CONFIG, cfg["v2"])
         models = gs.Models(v2)
         log(f"GPU stages: device {models.device}" + ("  (MOCK MODELS)" if models.mock else ""))
@@ -525,7 +524,7 @@ def run_batch(selection: pd.DataFrame, cfg: dict | None = None, stages=("cpu", "
             collect_summary(cfg, selection)
             continue
         if is_vlm and captioner is None:
-            import captions as cap
+            from rewind import captions as cap
             free_gpu_memory(models)
             models = None
             captioner = cap.Captioner(cfg["vlm"])
@@ -571,8 +570,8 @@ def run_batch(selection: pd.DataFrame, cfg: dict | None = None, stages=("cpu", "
 
 def main() -> None:
     ap = argparse.ArgumentParser(description="Run the pipeline on every video in selection.csv "
-                                             "(same as pipeline.ipynb, which is the main way to run it).")
-    ap.add_argument("--selection", default=str(ROOT / "selection.csv"))
+                                             "(same as 1_pipeline.ipynb, which is the main way to run it).")
+    ap.add_argument("--selection", default=str(paths.SELECTION))
     ap.add_argument("--data-root", default=str(ds.DATA_ROOT))
     ap.add_argument("--stages", nargs="+", default=["cpu", "gpu", "vlm"], choices=list(PHASES) + ["vlm"])
     ap.add_argument("--meva-min", type=float, default=60)

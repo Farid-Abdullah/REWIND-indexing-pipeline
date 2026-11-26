@@ -1,0 +1,24 @@
+# Python packages for the full pipeline (GPU stages, captions, search).
+#   pip install -r requirements.txt && pip install -e .
+# Tested on the team VM (26 Nov 2026, Python 3.13, 2x L4): torch 2.15.0+cu132, transformers 5.23.0,
+# ultralytics 8.4.215, sentencepiece 0.2.3, OpenCV 5.0.0. Install torch first with the CUDA build that
+# matches the machine (https://pytorch.org/get-started/locally/), then the rest.
+numpy
+pandas
+matplotlib
+pillow
+imageio
+tqdm
+pyyaml                    # MEVA annotations
+imagehash
+opencv-python-headless    # check `import cv2` after installing ultralytics (it adds opencv-python)
+packaging
+torch
+transformers>=4.57        # Qwen2.5-VL / Qwen3-VL captions; 5.x works
+accelerate
+sentencepiece             # SigLIP's tokenizer: without it SigLIP is silently skipped
+protobuf
+ultralytics               # YOLO-World + ByteTrack
+lap
+ipykernel                 # run the notebooks
+nbconvert

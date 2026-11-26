@@ -18,7 +18,7 @@ What the ground truth means is different for the two datasets:
   check: does every sentence's time span get at least one keyframe? A span without a keyframe can never be
   found by a search over keyframes. (Later, the same sentences are the text queries for Recall@K.)
 
-Command line:  python datasets.py            -> prints what is on disk (videos, hours, annotations)
+Command line:  python -m rewind.data            -> prints what is on disk (videos, hours, annotations)
 """
 
 from __future__ import annotations
@@ -33,7 +33,9 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-DATA_ROOT = Path("/mnt/5T_storage/clipsExtraction/datasets")
+from rewind import paths
+
+DATA_ROOT = paths.DATA_ROOT
 
 # 2018-03-13.15-50-00.15-55-00.school.G328.r13   (date . start . end . site . camera [. release])
 MEVA_NAME = re.compile(r"^(\d{4}-\d{2}-\d{2})\.(\d{2}-\d{2}-\d{2})\.(\d{2}-\d{2}-\d{2})\.([^.]+)\.([^.]+?)(?:\.(r\d+))?$")
@@ -183,7 +185,7 @@ def uca_category(video_id: str) -> str:
 def uca_inventory(data_root: Path = DATA_ROOT, video_dir: str = "dev_videos") -> pd.DataFrame:
     """One row per UCA video in uca/<video_dir>/, with split and duration from the annotations
     (probed from the file when a video has no annotation)."""
-    from video_utils import video_info
+    from rewind.utils.video_utils import video_info
     ann = uca_annotations(data_root)
     rows = []
     for p in sorted((Path(data_root) / "uca" / video_dir).glob("*")):

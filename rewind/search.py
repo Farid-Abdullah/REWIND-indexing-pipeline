@@ -1,7 +1,7 @@
 """Search: type a sentence, get ranked clips with times. And the evaluation that scores it against ground truth.
 
-Used by search.ipynb (build, evaluate, try a query) and explore.ipynb section 8 (look at the results).
-Reads what pipeline.ipynb saved in outputs/batch/; writes outputs/batch/search/.
+Used by 2_search.ipynb (build, evaluate, try a query) and 3_explore.ipynb section 8 (look at the results).
+Reads what 1_pipeline.ipynb saved in outputs/batch/; writes outputs/batch/search/.
 
 Methods compared (all return moments: video + start + end):
   captions            the query vs each clip's caption text (sentence embeddings, bge-small)          -> clips
@@ -32,8 +32,8 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-import caption_eval as ce
-from video_utils import read_frames, video_info
+from rewind import caption_eval as ce
+from rewind.utils.video_utils import read_frames, video_info
 
 SEARCH_CONFIG = {
     "text_model": ce.TEXT_MODEL,               # sentence embeddings for captions and queries
@@ -108,7 +108,7 @@ class _Mock:
     """Fake image/text encoder (no model): deterministic vectors, for plumbing checks only."""
 
     def __init__(self, dim=64, seed=0):
-        import gpu_stages as gs
+        from rewind import gpu_stages as gs
         self.m = gs.MockSigLIP(dim)
         self.seed = seed
 
@@ -125,7 +125,7 @@ class _HFImageText:
     def __init__(self, name, device, siglip):
         import torch
         from transformers import AutoModel, AutoProcessor
-        from gpu_stages import _as_tensor
+        from rewind.gpu_stages import _as_tensor
         self.torch, self.device, self.siglip, self._as_tensor = torch, device, siglip, _as_tensor
         self.dtype = torch.float16 if device.startswith("cuda") else torch.float32
         self.model = AutoModel.from_pretrained(name).to(device, self.dtype).eval()
@@ -628,7 +628,7 @@ def save(index: SearchIndex, queries, results, per_query, met, lat=None):
 
 
 # ---------------------------------------------------------------------------------------------------
-# Pictures for explore.ipynb section 8
+# Pictures for 3_explore.ipynb section 8
 # ---------------------------------------------------------------------------------------------------
 _paths = {}
 
@@ -676,7 +676,7 @@ def result_strip(res: pd.DataFrame, spans=None, n=5, width=240):
 
 
 def load_outputs(out_root):
-    """Everything search.ipynb saved, as a dict of DataFrames (missing files -> None)."""
+    """Everything 2_search.ipynb saved, as a dict of DataFrames (missing files -> None)."""
     d = Path(out_root) / "search"
     out = {}
     for name in ("queries", "results", "per_query", "metrics", "latency", "demo_results"):

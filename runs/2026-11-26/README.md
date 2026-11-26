@@ -1,8 +1,10 @@
 # Run of 26 Nov 2026: first full run with captions
 
-`pipeline_run.ipynb` and `explore_run.ipynb` are the two notebooks **with their outputs**, as run on the VM
-(one L4, Qwen2.5-VL-7B-Instruct, `selection.csv` = 12 MEVA videos (1.0 h) + 26 UCA val videos (1.0 h)).
-The clean, runnable versions are `pipeline.ipynb` / `explore.ipynb` in the repo root.
+`pipeline_run.ipynb`, `search_run.ipynb` and `explore_run.ipynb` are the notebooks **with their outputs**, as run
+on the VM (one L4, Qwen2.5-VL-7B-Instruct, `selection.csv` = 12 MEVA videos (1.0 h) + 26 UCA val videos (1.0 h)).
+They were run before the repository was reorganised, so their import lines (`import batch`, `import search`, ...)
+are the old ones. The clean, runnable versions are `notebooks/1_pipeline.ipynb`, `2_search.ipynb` and
+`3_explore.ipynb`.
 
 ## What ran
 
@@ -12,6 +14,7 @@ The clean, runnable versions are `pipeline.ipynb` / `explore.ipynb` in the repo 
 | GPU (stages 3-4) | 8.8 min | 38/38 videos, **SigLIP embeddings for all 38** (sentencepiece fixed); 2,673 index records |
 | Clip captions | 27.2 min | 167 clips (64 MEVA, 103 UCA), 3 not valid JSON; ~10 s per clip; peak VRAM 19.8 GB |
 | Frame captions | stopped by hand | 220 of 2,673 frames (2 MEVA videos); 3.8 s per frame at batch 8 |
+| Search (`search_run.ipynb`) | 3.3 min | index of 167 clips + 2,673 frames; baselines embedded 7,239 frames (1/s) in 3.2 min; 218 queries x 5 methods scored in 27 s |
 
 Indexing cost at clip level on one L4: about 21 min of compute per hour of video (CPU 4.4 + GPU 4.9 + clips 12),
 so roughly 3 hours of video per compute-hour.
@@ -42,3 +45,18 @@ so roughly 3 hours of video per compute-hour.
 5. **No hand-check sheet yet:** it samples frame captions, and the frame phase was stopped.
 6. **Recall of the "notable" field is low:** 4 of the 24 non-normal UCA videos were flagged (no arson, robbery,
    shooting, shoplifting, stealing or vandalism clip was).
+
+## Search (218 queries: 194 UCA sentences, 24 MEVA activity types)
+
+| Method | UCA R@5 IoU 0.3 | UCA R@5 lenient | UCA own video R@5 IoU 0.3 | MEVA R@5 lenient |
+|---|---|---|---|---|
+| captions | 14.4 | 32.5 | 35.1 | 62.5 |
+| siglip_selected | 17.0 | 33.0 | 40.7 | 50.0 |
+| **hybrid** | **19.6** | **42.3** | 35.1 | **79.2** |
+| siglip_1fps (baseline) | 19.1 | 27.3 | 44.8 | 33.3 |
+| clip_1fps (baseline) | 18.0 | 22.2 | 47.9 | 29.2 |
+
+Reachable (an answer overlaps an indexed clip): UCA 88.7%, MEVA 95.8%. Hybrid finds the right clip far more often
+than the baselines but is no better at the exact moment (and worse within one video, where the baselines have a
+frame every second). UCA misses (hybrid): 46% search, 11% gating. Median 36 ms per query. MEVA lenient is inflated by
+dense labels. No "nothing found": unrelated operator queries still return a clip.

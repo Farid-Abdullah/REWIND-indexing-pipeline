@@ -1,4 +1,5 @@
-# conda env create -f environment.yml
+# Local CPU-only environment (stages 1-2, notebooks): conda env create -f environment.yml, then pip install -e .
+# The full pipeline (GPU, captions, search) needs requirements.txt; see README.
 name: motion-gating
 channels:
   - conda-forge
@@ -14,7 +15,7 @@ dependencies:
   - imageio
   - ffmpeg
   - tqdm
-  - pyyaml          # MEVA annotations (datasets.py falls back to a line parser without it)
+  - pyyaml          # MEVA annotations (rewind/data.py falls back to a line parser without it)
   - ipykernel
   - notebook
   - nbconvert

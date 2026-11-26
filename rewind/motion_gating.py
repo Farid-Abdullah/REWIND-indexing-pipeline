@@ -1,6 +1,6 @@
 """Stage 1: motion gating. Find the time ranges of a fixed-camera video where something moves.
 
-Run:  python motion_gating.py [video]          (default: video/meva_30min.mp4)
+Run:  python -m rewind.motion_gating [video]          (default: video/meva_30min.mp4)
 Writes outputs/<video name>/motion_scores.csv and segments.csv (+ a cache of the slow decode pass).
 
 Steps:
@@ -26,16 +26,16 @@ import cv2
 import numpy as np
 import pandas as pd
 
-from keyframes import gray_hist, tile_phash
-from video_utils import format_hms, iter_sampled_frames, video_info
+from rewind.keyframes import gray_hist, tile_phash
+from rewind.utils.video_utils import format_hms, iter_sampled_frames, video_info
+from rewind import paths
 
-ROOT = Path(__file__).resolve().parent  # folder containing this file
-DEFAULT_VIDEO = ROOT / "video" / "meva_30min.mp4"
+DEFAULT_VIDEO = paths.REPO / "video" / "meva_30min.mp4"   # single-video runs: put videos in video/ (git-ignored)
 
 
 def output_dir(video_path: str | Path) -> Path:
     """outputs/<video name without extension>/, so several videos don't overwrite each other."""
-    return ROOT / "outputs" / Path(video_path).stem
+    return paths.OUTPUTS / Path(video_path).stem
 
 
 # Default parameters (the notebook's config cell uses the same values)

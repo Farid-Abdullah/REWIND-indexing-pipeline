@@ -1,4 +1,4 @@
-"""Drawing helpers for pipeline.ipynb: thumbnails, image grids, mask overlays, timeline plot, GIFs.
+"""Drawing helpers for 1_pipeline.ipynb: thumbnails, image grids, mask overlays, timeline plot, GIFs.
 
 Nothing here opens a window (no cv2.imshow), so it also works on a machine without a screen.
 Images are NumPy arrays in OpenCV's BGR colour order.
@@ -15,8 +15,8 @@ import cv2
 import numpy as np
 import pandas as pd
 
-from motion_gating import smooth
-from video_utils import format_hms, read_frames
+from rewind.motion_gating import smooth
+from rewind.utils.video_utils import format_hms, read_frames
 
 # Colour per keyframe reason (hex, for matplotlib)
 REASON_COLORS = {"first": "#2b8cbe", "peak": "#e34a33", "change": "#31a354", "maxgap": "#756bb1", "heartbeat": "#636363"}

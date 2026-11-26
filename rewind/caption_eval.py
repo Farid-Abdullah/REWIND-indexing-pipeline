@@ -1,6 +1,6 @@
 """How good are the captions? Three checks on what the pipeline already saved (no re-run needed).
 
-Used by explore.ipynb section 6. Each function reads outputs/batch/ and returns tables; nothing here calls the VLM.
+Used by 3_explore.ipynb section 6. Each function reads outputs/batch/ and returns tables; nothing here calls the VLM.
 
 1. detector_crosscheck   Automatic, all clips. Compares what a clip caption mentions (people, vehicles, bags, boxes,
                          ...) with what YOLO-World tracked in the same seconds (events/tracks.csv). Mentioned but

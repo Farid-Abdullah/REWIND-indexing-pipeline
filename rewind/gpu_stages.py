@@ -1,4 +1,4 @@
-"""GPU stages of the REWIND pipeline (from Muzayyan's v2 pipeline). Used by pipeline.ipynb.
+"""GPU stages of the REWIND pipeline (from Muzayyan's v2 pipeline). Used by 1_pipeline.ipynb.
 
 Stage 1 (diff + MOG2 motion gating) and the CPU keyframes live in motion_gating.py and keyframes.py.
 This file adds what needs deep models:
@@ -35,7 +35,7 @@ import cv2
 import numpy as np
 import pandas as pd
 
-from video_utils import format_hms, read_frames
+from rewind.utils.video_utils import format_hms, read_frames
 
 # =============================================================================
 # Configuration

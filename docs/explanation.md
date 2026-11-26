@@ -1,6 +1,6 @@
 # What the pipeline does, step by step (and what to tune)
 
-Every step that `pipeline.ipynb` runs, in order, with every setting, what it does, what happens if you raise or
+Every step that `1_pipeline.ipynb` runs, in order, with every setting, what it does, what happens if you raise or
 lower it, and what it did in our first real run. Written so we can tune the pipeline on purpose instead of by
 guesswork. The method write-up with references is `docs/pipeline.md`; this file is the hands-on companion.
 
@@ -10,7 +10,7 @@ Wall time 15.3 min (CPU phase 7.9 min, GPU phase 7.4 min). No video failed.
 Kernel "rewind (5T)" ran **Python 3.13** from `/mnt/5T_storage/clipsExtraction/tools/awsenv`, not the
 `motion-gating` conda env (3.11) described in `environment.yml`. Packages must be installed into that env.
 
-Conventions: `NAME=value` is a setting and its default. "Config" means the config cell of `pipeline.ipynb`
+Conventions: `NAME=value` is a setting and its default. "Config" means the config cell of `1_pipeline.ipynb`
 (`CFG`), which overrides the code defaults. Code is referred to as `file.function`.
 
 ---
@@ -28,13 +28,13 @@ Conventions: `NAME=value` is a setting and its default. "Config" means the confi
 | Ground-truth check | ✅ ran | all 38 videos have labels |
 | 3. Detector + tracker (YOLO-World + ByteTrack) | ✅ ran | most events are `person_appears`; IDs switch a lot |
 | 3. SigLIP tags + **image embeddings** | ❌ **failed to load** | `SiglipTokenizer requires the SentencePiece library`. Fix: `pip install sentencepiece protobuf` in the awsenv, restart the kernel |
-| 3. X-CLIP clip tags | ✅ loaded and ran | in the video inspected in `explore.ipynb`, every event key is one the tracker rules produce; X-CLIP contributed nothing visible (check the `source` column of `events.csv`) |
+| 3. X-CLIP clip tags | ✅ loaded and ran | in the video inspected in `3_explore.ipynb`, every event key is one the tracker rules produce; X-CLIP contributed nothing visible (check the `source` column of `events.csv`) |
 | 4. Samplers `novelty`, `kcenter`, `importance` | ⏭️ **skipped** | they need SigLIP embeddings |
 | 4. Primary sampler | ⚠️ **fell back** | `primary="kcenter"` didn't run, so the hand-off used `phash` |
 | 4. Stage-4 JPGs | ⚠️ **none written** | `export_jpgs=["kcenter"]` and kcenter didn't run |
 | 4. Hand-off `index_records.jsonl` | ⚠️ written, **without embeddings** | `index_embeddings.npy` is empty; `embedding_row` points nowhere; `siglip_tag` is empty |
 | Coverage / redundancy metrics | ⚠️ NaN | need embeddings |
-| 5. Captions (VLM) | ⏭️ **not in this run** | `captions.py` was added on 26 Nov; tested only with a fake captioner. Phases `vlm_clips`, `vlm_frames` of `pipeline.ipynb` |
+| 5. Captions (VLM) | ⏭️ **not in this run** | `captions.py` was added on 26 Nov; tested only with a fake captioner. Phases `vlm_clips`, `vlm_frames` of `1_pipeline.ipynb` |
 
 So after this run we have segments, keyframes, tracks and a ground-truth check, but **no search embeddings yet**.
 Installing `sentencepiece` and re-running only the GPU phase (`STAGES=["gpu"]`, `FORCE=True`) fixes most of the
@@ -43,7 +43,7 @@ Installing `sentencepiece` and re-running only the GPU phase (`STAGES=["gpu"]`, 
 ```
 video (25-30 frames/s)
  │
- ├─ 0  datasets.py     which videos, their camera / clock time / labels
+ ├─ 0  rewind/data.py     which videos, their camera / clock time / labels
  ├─ 1  motion gating   5 samples/s, 320 px, CPU      → motion score per sample → threshold → segments
  ├─ 2  keyframes       inside segments, CPU          → a few frames per segment (+ 1 per 5 idle min)
  ├─ GT check           CPU                           → did segments / keyframes catch the labelled moments?
@@ -54,9 +54,9 @@ video (25-30 frames/s)
 
 ---
 
-## Step 0: datasets and selection (`datasets.py`)
+## Step 0: datasets and selection (`rewind/data.py`)
 
-### What is on disk (section 1 of `pipeline.ipynb`)
+### What is on disk (section 1 of `1_pipeline.ipynb`)
 
 | | Videos | Hours | With labels | Labelled items |
 |---|---|---|---|---|
@@ -165,7 +165,7 @@ removes blobs that are only light changes.
 | `mog2_illum_ncc` | 0.7 | a blob whose texture still correlates (NCC) with the background image above 0.7 is treated as a light change and removed. `None` = off | removes fewer blobs (more lighting false alarms) | removes more (risk: removes real people) |
 | `min_pixels` (code) | 8 | blobs smaller than this are kept without judging | | |
 
-**What the run showed (G421 15:55, `explore.ipynb` section 5):** the peak-frame mask is red on people across the
+**What the run showed (G421 15:55, `3_explore.ipynb` section 5):** the peak-frame mask is red on people across the
 hall, as it should be, but some blobs on people near the bright window are **yellow** (removed by the lighting
 filter). Flat or low-texture regions (plain clothes, a person in front of a plain wall) correlate easily with
 the background, so the filter can eat real people. On synthetic test videos with flat-coloured moving blocks it
@@ -221,7 +221,7 @@ Applied in this order:
 Output per segment: `segment_id, start_s, end_s, duration_s, peak_score, peak_time_s, peak_frame_idx, mean_score`
 (`segments.csv`, chosen gate only). `motion_scores.csv` has every sample, every score and an `active_<gate>` flag.
 
-### 1.7 Results per gate (both datasets, from `explore.ipynb` section 3)
+### 1.7 Results per gate (both datasets, from `3_explore.ipynb` section 3)
 
 | Dataset | Gate | Active % | Keyframes | Labelled items with a keyframe | Labelled events a segment covers |
 |---|---|---|---|---|---|
@@ -408,7 +408,7 @@ failure as in the earlier café run.
 event bank + "nothing is happening" with a **softmax over 13 prompts**. An event needs probability >
 `xclip_threshold=0.35` and above the background prompt.
 
-**In the run:** loaded and ran (`[05:53:50] loaded xclip on cuda`). In the video inspected in `explore.ipynb`
+**In the run:** loaded and ran (`[05:53:50] loaded xclip on cuda`). In the video inspected in `3_explore.ipynb`
 all event keys are tracker keys. With 13 prompts sharing one softmax, 0.35 is rarely reached (also seen in the
 café run: 0 events). Options: compare against the background prompt with a margin (like SigLIP), lower the
 threshold, or drop X-CLIP.
@@ -482,7 +482,7 @@ isn't valid JSON is kept as plain text (`parse_ok=False`) so the frame stays sea
 | `clip_max_frames` | 6 | sees more of a long clip; slower, more VRAM | faster; may miss short actions |
 | `clip_min_frames` | 3 | more evenly spaced filler frames | trusts stage 2/4's choice more |
 | `clip_max_s` | 60 s | fewer, longer clips; coarser timestamps | more clips, finer timestamps, more calls |
-| `batch_size` | 8 in `pipeline.ipynb` (4 in the code) | faster per frame if VRAM allows | 4 or 2 if CUDA runs out of memory |
+| `batch_size` | 8 in `1_pipeline.ipynb` (4 in the code) | faster per frame if VRAM allows | 4 or 2 if CUDA runs out of memory |
 | `max_new_tokens_frame` / `_clip` | 400 / 500 | fewer cut-off JSON answers in busy scenes | faster |
 | `review_n` (top level of `CFG`) | 60 | tighter hallucination estimate | quicker hand check |
 
@@ -494,7 +494,7 @@ pre-flight cell shows each card's free memory. Each phase loads the model again 
 Changing any caption setting except `batch_size` makes `settings_hash` change, and that video's captions are made
 again. Same settings → only missing clips / frames are captioned (`FRESH_RUN = False` continues a stopped run).
 
-**What to look at after a run:** `explore.ipynb` section 5 (one video's clips next to their frames and the labels
+**What to look at after a run:** `3_explore.ipynb` section 5 (one video's clips next to their frames and the labels
 of the same span) and section 6 (unparsed answers, s per clip / frame, estimated VLM minutes per video-hour, clips
 flagged as unusual), then the three quality checks: detector cross-check, captions vs labels, and the hand check
 (`outputs/batch/clip_review/review_<k>.html` + `.csv`, 30 clips over 5 people; re-run the last cell of section 6 for
@@ -502,11 +502,11 @@ the hallucination and miss rate).
 
 ---
 
-## Search (`search.py`, run by `search.ipynb`)
+## Search (`search.py`, run by `2_search.ipynb`)
 
 Builds an in-memory index from the clip captions and stage 4's SigLIP embeddings, makes the test queries from the
 ground truth (`outputs/batch/search/queries.csv`; edit it to add your own), runs every query through every method,
-and writes the scores to `outputs/batch/search/`. `explore.ipynb` section 8 shows them. Settings
+and writes the scores to `outputs/batch/search/`. `3_explore.ipynb` section 8 shows them. Settings
 (`search.SEARCH_CONFIG`, overridden by `CFG` in the notebook):
 
 | Setting | Default | Raise it → | Lower it → |
@@ -547,7 +547,7 @@ helps; "where are the misses" splits failures into gating and search.
 | `summary_vlm.json`, `error_vlm_clips.json`, `error_vlm_frames.json` | batch | stage 5's row / errors |
 
 Batch level (`outputs/batch/`): `batch_summary.csv`, `selection_used.csv`, `batch_config.json`,
-`clip_review/review_<k>.csv` + `.html` (hand check of caption quality, made by `explore.ipynb`).
+`clip_review/review_<k>.csv` + `.html` (hand check of caption quality, made by `3_explore.ipynb`).
 
 ---
 
@@ -586,7 +586,7 @@ will add time once it loads) and **without** any captioning, which will be the e
 
 ## Suggested experiments, cheapest first
 
-Each is a config change + re-run. Compare in `explore.ipynb` sections 1 and 3 against the evenly-spaced baseline.
+Each is a config change + re-run. Compare in `3_explore.ipynb` sections 1 and 3 against the evenly-spaced baseline.
 
 | # | Change | Expected effect | Re-runs |
 |---|---|---|---|

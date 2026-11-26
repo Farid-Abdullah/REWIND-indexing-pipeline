@@ -7,57 +7,90 @@ On the 30-min MEVA test video the v1 settings kept 109 keyframes instead of 1,80
 **Docs:** `docs/explanation.md` walks through every step and setting (for tuning) and lists what was skipped or
 failed in the last run; `docs/pipeline.md` is the method write-up with references and results.
 
-## Run it (branch `moreVids`: many videos)
+## Layout
 
-**On the VM, the first time.** Clone the branch into a new folder, so nothing in the old checkout (its notebook,
-outputs, caches) is touched. The repo is public, so no GitHub login is needed on the VM:
+```
+notebooks/            run these, in order
+  1_pipeline.ipynb    videos -> segments, keyframes, events, SigLIP embeddings, captions (outputs/batch/)
+  2_search.ipynb      search index, test queries from the ground truth, scores vs baselines (outputs/batch/search/)
+  3_explore.ipynb     look at everything (no re-running)
+rewind/               the code (imported by the notebooks as `from rewind import ...`)
+  paths.py            where outputs/, selection.csv and the datasets are
+  data.py             MEVA / UCA discovery, video selection, ground truth
+  motion_gating.py    stage 1      keyframes.py   stage 2
+  gpu_stages.py       stages 3-4 (YOLO-World + ByteTrack, SigLIP, X-CLIP, frame selection, hand-off)
+  captions.py         stage 5 (Qwen-VL clip and frame captions)
+  batch.py            runs the phases over every video (what 1_pipeline.ipynb calls)
+  search.py           search + its evaluation        caption_eval.py   caption quality checks
+  utils/              video_utils.py (frame reading), visualize.py (plots, GIFs, boxes)
+docs/                 pipeline.md (method + results), explanation.md (every setting, for tuning)
+runs/2026-11-26/      the notebooks of the 26 Nov run with all their outputs
+outputs/              results (git-ignored)    selection.csv   the videos of the batch (made on the first run)
+```
+
+## Run it
+
+**Once per machine.** Clone, then register the package in the environment the notebooks run in (on the VM: the
+**rewind (5T)** kernel's environment). `pip install -e .` installs nothing else and never touches torch; if you
+skip it, the notebooks still find the code as long as they are opened from `notebooks/`.
 
 ```bash
 cd /mnt/5T_storage
-git clone -b moreVids https://github.com/Farid-Abdullah/cctv-motion-gating rewind-batch
-cd rewind-batch
+git clone https://github.com/Farid-Abdullah/cctv-motion-gating rewind
+cd rewind
+pip install -e .              # inside the environment of the notebook kernel
 ```
 
-**Three notebooks, always in this order:**
+An existing checkout: `git pull`, then `pip install -e .` once. `outputs/` and `selection.csv` stay where they
+were (the repository folder), so earlier results are still found.
 
-1. **`pipeline.ipynb`** (kernel **rewind (5T)**): check the config cell (`VLM_MODEL`, `VLM_DEVICE`, `STAGES`), then
-   *Run All*. It checks the environment first (GPU, `sentencepiece`, YOLO, the Qwen folder) and stops before touching
-   anything if something is missing; then deletes the old results (`FRESH_RUN = True`) and runs every phase over every
-   video. No pictures, one line per video; everything also goes to `outputs/batch/run_log.txt`.
-2. **`search.ipynb`**: *Run All*. Builds the search index from the captions and SigLIP embeddings, makes the test
+**Three notebooks, always in this order (all in `notebooks/`):**
+
+1. **`1_pipeline.ipynb`**: check the config cell (`VLM_MODEL`, `VLM_DEVICE`, `STAGES`), then *Run All*. It checks
+   the environment first (GPU, `sentencepiece`, YOLO, the Qwen folder) and stops before touching anything if
+   something is missing; then deletes the old results (`FRESH_RUN = True`) and runs every phase over every video.
+   No pictures, one line per video; everything also goes to `outputs/batch/run_log.txt`. About 45 min for 2 h of video.
+2. **`2_search.ipynb`**: *Run All*. Builds the search index from the captions and SigLIP embeddings, makes the test
    queries from the ground truth, runs them through every search method and the two baselines, scores them, saves
    `outputs/batch/search/`. Ends with a *try a query* cell. A few minutes.
-3. **`explore.ipynb`**: *Run All* to see all the results: gating, keyframes, events, the captions next to their
+3. **`3_explore.ipynb`**: *Run All* to see all the results: gating, keyframes, events, the captions next to their
    frames and the labelled moments, and (section 8) the search scores and example results with their frames.
 
-If the run stops part-way (VS Code disconnects, you interrupt it): set `FRESH_RUN = False` in `pipeline.ipynb` and
-*Run All* again; it continues where it stopped. The same functions also run from a terminal (`python batch.py --fresh`,
-see its docstring), but the notebooks are the main way.
+If the run stops part-way (VS Code disconnects, you interrupt it): set `FRESH_RUN = False` in `1_pipeline.ipynb`
+and *Run All* again; it continues where it stopped. The same functions also run from a terminal
+(`python -m rewind.batch --fresh`, see its docstring), but the notebooks are the main way.
 
 - **Which videos:** `selection.csv`, made on the first run: ~1 h of MEVA (whole 5-min time slots of all 4 cameras,
   annotated slots first) + ~1 h of UCA `dev_videos` (spread over categories, test split first). Edit it to change
-  the set, or delete it to pick again. Data paths: `DATA_ROOT` in the config cell
-  (`/mnt/5T_storage/clipsExtraction/datasets`).
+  the set, or delete it to pick again. Data paths: `DATA_ROOT` in the config cell (default in `rewind/paths.py`:
+  `/mnt/5T_storage/clipsExtraction/datasets`).
 - **Four phases, in order, each over every video:** `cpu` (stages 1-2), `gpu` (stages 3-4), `vlm_clips` (a caption
   per clip), `vlm_frames` (a caption per selected frame; the slow one, hours). A later phase never costs earlier
-  results; `explore.ipynb` works with whatever has finished.
+  results; `3_explore.ipynb` works with whatever has finished.
 - **Resume:** with `FRESH_RUN = False`, `cpu` / `gpu` skip finished videos and the caption phases continue at the
   next clip / frame. A failing video is logged and skipped; its traceback is in
   `outputs/batch/<dataset>/<video>/error_<phase>.json`.
-- **Ground truth** comes from the datasets themselves (`datasets.py`): MEVA activity labels (`*.activities.yml`,
+- **Ground truth** comes from the datasets themselves (`rewind/data.py`): MEVA activity labels (`*.activities.yml`,
   frame numbers / fps) and UCA sentences with timestamps. No hand-made CSV needed.
+- **Plumbing check without GPU or data:** `REWIND_MOCK=1` (fake models), with `REWIND_DATA_ROOT`, `REWIND_OUT_ROOT`
+  and `REWIND_SELECTION` pointing at a small fake dataset.
 
-**Single video / command line:** `python motion_gating.py video/x.mp4` then `python keyframes.py video/x.mp4`.
+**Single video / command line:** `python -m rewind.motion_gating video/x.mp4`, then
+`python -m rewind.keyframes video/x.mp4` (results in `outputs/<video name>/`; `video/` is git-ignored).
 
 **Environment** (if you need a new one):
 
 ```bash
-conda env create -f environment.yml          # once (on the VM: add -p /mnt/5T_storage/envs/motion-gating)
-conda activate motion-gating
-python -m ipykernel install --user --name motion-gating   # once, makes the env available in Jupyter
+# full pipeline (GPU): any Python >= 3.11 environment; install torch for the machine's CUDA first
+pip install -r requirements.txt
+pip install -e .
+python -m ipykernel install --user --name rewind   # once, makes the env available in Jupyter
+
+# local, CPU only (stages 1-2 and the notebooks), e.g. on Windows
+conda env create -f environment.yml && conda activate motion-gating && pip install -e .
 ```
 
-## Stage 1: motion gating (`motion_gating.py`)
+## Stage 1: motion gating (`rewind/motion_gating.py`)
 
 1. **Look at 5 frames per second, not 30.** Neighbouring frames are almost identical, so this is 6× less work.
 2. **Shrink to 320 px and blur.** Motion doesn't need detail. This is faster, and blurring hides pixel noise.
@@ -77,14 +110,14 @@ python -m ipykernel install --user --name motion-gating   # once, makes the env 
 8. **Segments.** *Hysteresis*: start above a high threshold, stop below a lower one, so it doesn't flicker on and off.
    Then merge gaps under 3 s, drop pieces under 1 s, and add 2 s padding on each side.
 
-**Optional gates** (config cell of `pipeline.ipynb`): the *deep gate* (`gpu_stages.scan_deep`) compares DINOv2 features of 14×14-pixel patches
+**Optional gates** (config cell of `1_pipeline.ipynb`): the *deep gate* (`gpu_stages.scan_deep`) compares DINOv2 features of 14×14-pixel patches
 with a slowly learned background, 2 frames/s, GPU. The *fused gate* divides each gate's score by its own threshold and
 averages the two highest: a soft "two gates agree" vote. On the café ground truth MOG2 and fused were nearly tied, so
 MOG2 stays the default (`GATE` in the config).
 
 The slow part (decoding, ~50 s) is **cached** in `outputs/<video>/cache/` after first run, so changing thresholds afterwards takes about a second.
 
-## Stage 2: keyframes (`keyframes.py`)
+## Stage 2: keyframes (`rewind/keyframes.py`)
 
 For each segment, keep:
 - **first**: the first frame
@@ -98,7 +131,7 @@ Then drop **near-duplicates**. Outside segments, keep one **heartbeat** frame ev
 similar images get similar bits. The frame is split into 4×4 tiles with one hash each, so a few small people moving still change their
 tile. Distance = how many bits differ (*Hamming distance*).
 
-## Stages 3-4: events and frames for the index (`gpu_stages.py`, GPU)
+## Stages 3-4: events and frames for the index (`rewind/gpu_stages.py`, GPU)
 
 Only inside segments, 4 frames/s:
 - **tracks**: YOLO-World finds people and objects, ByteTrack follows them; rules turn tracks into events
@@ -111,7 +144,7 @@ Then several **samplers** choose which of those frames go to the captioner and t
 scored side by side with stage 2's keyframes. The chosen frames are written to `events/index_records.jsonl`
 (camera, time, events, objects) + `events/index_embeddings.npy` (SigLIP, 768 numbers per frame).
 
-## Stage 5: captions (`captions.py`, GPU)
+## Stage 5: captions (`rewind/captions.py`, GPU)
 
 A vision-language model (Qwen2.5-VL-7B by default; set `CFG["vlm"]["model"]` to another name or a local folder,
 Qwen3-VL works too) writes a JSON description of:
@@ -125,19 +158,19 @@ camera, start/end, clock time, text, `search_text`, preview image). Clips are ca
 (phase `vlm_clips`, ~7 s per clip on one L4), then frames (phase `vlm_frames`, ~5-10 s per frame), so an
 interrupted run still leaves every video searchable by clip. The model is loaded once for both.
 
-**Caption quality** (`caption_eval.py`, shown in `explore.ipynb` section 6, no re-run needed):
+**Caption quality** (`rewind/caption_eval.py`, shown in `3_explore.ipynb` section 6, no re-run needed):
 - *detector cross-check* (automatic, every clip): what a caption mentions (people, vehicles, bags, ...) vs what
   YOLO-World tracked in the same seconds: likely hallucinations, likely misses, people-count agreement;
 - *labels* (automatic): each UCA sentence / MEVA activity vs the caption of its clip, with a sentence-embedding
   model (`bge-small`), against other videos' captions as a baseline; plus top-1 / top-5 caption-only search;
 - *hand check*: 30 random clips split over 5 people, `outputs/batch/clip_review/review_<k>.html` (frames next to
   the caption) + `review_<k>.csv` to fill in; gives the hallucination and miss rate, and how far to trust the
-  detector cross-check. Model: `VLM_MODEL` in `pipeline.ipynb` (the VM's local Qwen2.5-VL-7B folder); needs `torch`,
+  detector cross-check. Model: `VLM_MODEL` in `1_pipeline.ipynb` (the VM's local Qwen2.5-VL-7B folder); needs `torch`,
 `transformers>=4.49` and ~17 GB free on each GPU in `VLM_DEVICE`. `VLM_DEVICE = ["cuda:0", "cuda:1"]` (the default)
 runs one copy of the model per L4, each on about half the video-time, so captioning takes about half as long;
 `"cuda:0"` uses one GPU. Plumbing check without a GPU: `REWIND_MOCK=1`.
 
-## Search (`search.py`, `search.ipynb`)
+## Search (`rewind/search.py`, `notebooks/2_search.ipynb`)
 
 Type a sentence, get ranked moments (video, camera, start-end, best frame). Everything is in memory: no database,
 no server. Methods, all scored the same way:
@@ -175,7 +208,7 @@ outdoor CCTV and need tuning per scene.
 
 Batch-level files in `outputs/batch/`: `batch_summary.csv` (one row per video, every number below), `selection_used.csv`,
 `batch_config.json`, `run_log.txt` (everything the run printed, with times), `clip_review/` (hand-check sheets,
-made by `explore.ipynb`), `search/` (search scores, see above). Per video, `summary_cpu.json` / `summary_gpu.json` hold that video's row, and `gt.csv` the
+made by `3_explore.ipynb`), `search/` (search scores, see above). Per video, `summary_cpu.json` / `summary_gpu.json` hold that video's row, and `gt.csv` the
 labelled items with a `has_keyframe` column.
 
 
@@ -239,6 +272,6 @@ git push vm main                    # laptop -> VM
 
 - `git push vm` is refused while the VM has uncommitted edits, so it can't overwrite someone's work in progress.
   Commit or stash on the VM first.
-- `video/` and `outputs/` are git-ignored, so videos and results don't sync. Copy them with `scp` or `rsync`
+- `video/`, `outputs/` and `selection.csv` are git-ignored, so videos and results don't sync. Copy them with `scp` or `rsync`
   if needed.
 - Any teammate can be the go-between. They just add the `vm` remote on their own machine.

@@ -13,3 +13,7 @@ __pycache__/
 
 # model weights downloaded by ultralytics into the working folder
 *.pt
+
+# the batch's video list is made per machine
+selection.csv
+*.egg-info/

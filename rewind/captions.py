@@ -1,10 +1,10 @@
 """Stage 5: VLM captioning. Turn the selected frames of each video into structured text for search.
 
-Run:  python captions.py                          every video under outputs/batch/ with stage 1-2 results
-      python captions.py outputs/batch/meva/<video>   one video folder
-      python captions.py --mock                   fake captioner, plumbing check only (no GPU, no model)
-      python captions.py --review 60              only (re)write the hand-check sheet for caption quality
-Also runs as the "vlm" phase of batch.py / pipeline.ipynb.
+Run:  python -m rewind.captions                          every video under outputs/batch/ with stage 1-2 results
+      python -m rewind.captions outputs/batch/meva/<video>   one video folder
+      python -m rewind.captions --mock                   fake captioner, plumbing check only (no GPU, no model)
+      python -m rewind.captions --review 60              only (re)write the hand-check sheet for caption quality
+Also runs as the "vlm" phase of batch.py / 1_pipeline.ipynb.
 
 Two levels, both written to <video folder>/captions/:
 
@@ -20,7 +20,7 @@ Two levels, both written to <video folder>/captions/:
 Every record also gets `search_text` (all the fields joined into one string) for a keyword or text-
 embedding search. The model is told to describe only what it can see and to put doubts in `uncertain`,
 because results are used as evidence and must not invent things; caption_eval.py checks that (hand check of
-clip captions, detector cross-check, comparison with the labels; explore.ipynb section 6).
+clip captions, detector cross-check, comparison with the labels; 3_explore.ipynb section 6).
 
 Resume: records already captioned with the same settings (model, prompts, image size) are kept; change a
 setting and that video is captioned again. Model weights: any Qwen2.5-VL / Qwen3-VL checkpoint, by Hugging
@@ -42,9 +42,8 @@ import numpy as np
 import pandas as pd
 from PIL import Image
 
-from video_utils import format_hms, read_frames, video_info
-
-ROOT = Path(__file__).resolve().parent
+from rewind.utils.video_utils import format_hms, read_frames, video_info
+from rewind import paths
 
 CAPTION_CONFIG = {
     "model": "Qwen/Qwen2.5-VL-7B-Instruct",   # HF name or local folder; Qwen3-VL works too (e.g. Qwen3-VL-8B-Instruct)
@@ -683,7 +682,7 @@ def video_dirs(out_root: Path) -> list[Path]:
 def main() -> None:
     ap = argparse.ArgumentParser(description="Stage 5: VLM captions for the selected frames and clips.")
     ap.add_argument("folders", nargs="*", help="video folders (default: every one under --out-root)")
-    ap.add_argument("--out-root", default=str(ROOT / "outputs" / "batch"))
+    ap.add_argument("--out-root", default=str(paths.BATCH))
     ap.add_argument("--model", default=CAPTION_CONFIG["model"])
     ap.add_argument("--device", default=CAPTION_CONFIG["device"])
     ap.add_argument("--levels", nargs="+", default=CAPTION_CONFIG["levels"], choices=["frames", "clips"])
