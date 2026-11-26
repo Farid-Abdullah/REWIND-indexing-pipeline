@@ -1,6 +1,6 @@
 """Stage 1: motion gating. Find the time ranges of a fixed-camera video where something moves.
 
-Run:  python motion_gating.py [video]          (default: video/meva_30min.mp4)
+Run:  python -m rewind.motion_gating [video]          (default: video/meva_30min.mp4)
 Writes outputs/<video name>/motion_scores.csv and segments.csv (+ a cache of the slow decode pass).
 
 Steps:
@@ -10,7 +10,7 @@ Steps:
                                      learned "empty scene"), with a filter that removes lighting changes
                       Each score = fraction of pixels marked as moving ("foreground").
                       The result is cached, so changing thresholds later costs no decoding.
-  2. thresholds     - fixed number, or adaptive: median + k * MAD of the scores
+  2. thresholds     - fixed number, or adaptive: median + k * MAD of the quieter half of the scores
   3. find_segments  - smooth -> hysteresis -> merge short gaps -> drop short segments -> pad
 """
 
@@ -26,16 +26,16 @@ import cv2
 import numpy as np
 import pandas as pd
 
-from keyframes import gray_hist, tile_phash
-from video_utils import format_hms, iter_sampled_frames, video_info
+from rewind.keyframes import gray_hist, tile_phash
+from rewind.utils.video_utils import format_hms, iter_sampled_frames, video_info
+from rewind import paths
 
-ROOT = Path(__file__).resolve().parent  # folder containing this file
-DEFAULT_VIDEO = ROOT / "video" / "meva_30min.mp4"
+DEFAULT_VIDEO = paths.REPO / "video" / "meva_30min.mp4"   # single-video runs: put videos in video/ (git-ignored)
 
 
 def output_dir(video_path: str | Path) -> Path:
     """outputs/<video name without extension>/, so several videos don't overwrite each other."""
-    return ROOT / "outputs" / Path(video_path).stem
+    return paths.OUTPUTS / Path(video_path).stem
 
 
 # Default parameters (the notebook's config cell uses the same values)
@@ -48,6 +48,7 @@ SCAN_PARAMS = dict(
     mog2_var_threshold=16.0,  # MOG2 sensitivity: lower = more pixels count as foreground
     mog2_learning_rate=-1.0,  # how fast the background adapts; -1 = automatic (1 / history)
     mog2_illum_ncc=0.7,       # lighting filter: drop blobs whose texture still matches the background (None = off)
+    mog2_color=True,          # MOG2 on the colour frame, so darker clothes aren't taken for shadows (False = old v1, grey)
     morph_kernel=3,           # size of the clean-up filter that removes isolated noise pixels
     ignore_polygons=[],       # regions to ignore, e.g. [[(0,0),(1,0),(1,0.22),(0,0.22)]] = top 22% (sky)
     hash_grid=4,              # keyframe fingerprints: 4x4 tiles (see keyframes.tile_phash)
@@ -58,6 +59,7 @@ SEGMENT_PARAMS = dict(
     threshold_mode="adaptive",  # "adaptive" (median + k*MAD) or "fixed"
     k=3.0,                    # adaptive: how many robust standard deviations above normal
     floor=0.001,              # adaptive threshold never below 0.1% of pixels
+    q_noise=0.5,              # adaptive: estimate "normal" from the quietest 50% of samples (1.0 = all, old v1)
     fixed_threshold={"mog2": 0.004, "diff": 0.006},  # used when threshold_mode="fixed"
     stop_ratio=0.5,           # hysteresis: stop threshold = 0.5 x start threshold
     smooth_s=1.0,             # rolling median over 1 s before thresholding
@@ -70,8 +72,9 @@ SEGMENT_PARAMS = dict(
 # ---------------------------------------------------------------------------------------------------
 # Per-frame processing
 # ---------------------------------------------------------------------------------------------------
-def preprocess(frame: np.ndarray, width: int = 320, blur_ksize: int = 5) -> tuple[np.ndarray, np.ndarray]:
-    """Shrink, convert to greyscale, blur. Returns (gray, blurred).
+def preprocess(frame: np.ndarray, width: int = 320, blur_ksize: int = 5, color: bool = False):
+    """Shrink, convert to greyscale, blur. Returns (gray, blurred), or (gray, blurred, blurred_colour)
+    with color=True (MOG2 in colour, see mog2_color).
 
     Why: motion detection doesn't need colour or full resolution. 320x180 has 16x fewer pixels than
     1280x720, so it's much faster, and averaging pixels also averages away sensor/compression noise.
@@ -82,8 +85,10 @@ def preprocess(frame: np.ndarray, width: int = 320, blur_ksize: int = 5) -> tupl
     height = max(2, int(round(h * width / w / 2)) * 2)  # keep aspect ratio, even number of rows
     small = cv2.resize(frame, (width, height), interpolation=cv2.INTER_AREA)  # INTER_AREA = good for shrinking
     gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
-    blurred = cv2.GaussianBlur(gray, (blur_ksize, blur_ksize), 0) if blur_ksize > 1 else gray
-    return gray, blurred
+    blur = (lambda im: cv2.GaussianBlur(im, (blur_ksize, blur_ksize), 0)) if blur_ksize > 1 else (lambda im: im)
+    if color:
+        return gray, blur(gray), blur(small)
+    return gray, blur(gray)
 
 
 def make_ignore_mask(width: int, height: int, polygons: list | None) -> np.ndarray | None:
@@ -143,13 +148,18 @@ class MotionScorer:
     """
 
     def __init__(self, diff_threshold=15, mog2_history=500, mog2_var_threshold=16.0, mog2_learning_rate=-1.0,
-                 morph_kernel=3, ignore_mask=None, mog2_illum_ncc=0.7):
+                 morph_kernel=3, ignore_mask=None, mog2_illum_ncc=0.7, mog2_color=False):
         self.diff_threshold = diff_threshold
+        self.mog2_color = mog2_color
         # MOG2 = "Mixture of Gaussians" background subtraction. For every pixel it keeps a few Gaussian
         # (bell-curve) models of the values that pixel usually has, learned over the last `history`
         # frames. A new value that fits none of them -> foreground. Because it learns, slow changes
         # (sun moving) are absorbed into the background, and so are objects that stop moving long enough.
         # detectShadows=True marks likely shadows with the value 127 instead of 255.
+        # A "shadow" = a pixel darker than the background (50-100% of its brightness) with the same colour.
+        # On a greyscale frame there is no colour to compare, so a person in mid-dark clothes on a light
+        # floor is called a shadow and dropped. mog2_color=True runs MOG2 on the colour frame instead
+        # (as the v2 pipeline did), so only darker pixels of the *same* colour count as shadow.
         self.mog2 = cv2.createBackgroundSubtractorMOG2(history=mog2_history, varThreshold=mog2_var_threshold,
                                                        detectShadows=True)
         self.learning_rate = mog2_learning_rate
@@ -168,8 +178,8 @@ class MotionScorer:
             fg = cv2.bitwise_and(fg, self.ignore_mask)
         return fg
 
-    def update(self, blurred: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-        """Feed the next frame; returns (fg_diff, fg_mog2)."""
+    def update(self, blurred: np.ndarray, blurred_color: np.ndarray | None = None) -> tuple[np.ndarray, np.ndarray]:
+        """Feed the next frame (grey, plus colour if mog2_color); returns (fg_diff, fg_mog2)."""
         # Frame differencing: pixels whose brightness changed by more than the threshold since the
         # previous sample. Simple and fast, but only sees things that are moving *right now*.
         if self.prev is None:
@@ -178,12 +188,16 @@ class MotionScorer:
             _, fg_diff = cv2.threshold(cv2.absdiff(blurred, self.prev), self.diff_threshold, 255, cv2.THRESH_BINARY)
         self.prev = blurred
 
-        raw = self.mog2.apply(blurred, learningRate=self.learning_rate)
+        use_color = self.mog2_color and blurred_color is not None
+        raw = self.mog2.apply(blurred_color if use_color else blurred, learningRate=self.learning_rate)
         _, fg_mog2 = cv2.threshold(raw, 200, 255, cv2.THRESH_BINARY)  # 255 stays, shadows (127) -> 0
         fg_mog2 = self._clean(fg_mog2)
         self.last_illum_removed = None
         if self.illum_ncc is not None and cv2.countNonZero(fg_mog2):
-            kept = remove_illumination_blobs(fg_mog2, blurred, self.mog2.getBackgroundImage(), self.illum_ncc)
+            bg = self.mog2.getBackgroundImage()
+            if bg.ndim == 3:  # colour MOG2: the texture comparison works on grey levels
+                bg = cv2.cvtColor(bg, cv2.COLOR_BGR2GRAY)
+            kept = remove_illumination_blobs(fg_mog2, blurred, bg, self.illum_ncc)
             self.last_illum_removed = cv2.subtract(fg_mog2, kept)
             fg_mog2 = kept
         return self._clean(fg_diff), fg_mog2
@@ -203,7 +217,7 @@ def _cache_key(video_path: Path, params: dict) -> str:
 
 def scan_video(video_path: str | Path, *, sample_fps=5.0, width=320, blur_ksize=5, diff_threshold=15,
                mog2_history=500, mog2_var_threshold=16.0, mog2_learning_rate=-1.0, mog2_illum_ncc=0.7,
-               morph_kernel=3, ignore_polygons=None, hash_grid=4, hist_bins=32,
+               mog2_color=True, morph_kernel=3, ignore_polygons=None, hash_grid=4, hist_bins=32,
                cache_dir: str | Path | None = None) -> dict:
     """Decode the video once and compute, for every sample: both motion scores, mean brightness, and
     the image fingerprints keyframes.py needs. Cached in cache_dir/scan_<key>.npz.
@@ -217,7 +231,8 @@ def scan_video(video_path: str | Path, *, sample_fps=5.0, width=320, blur_ksize=
     info = video_info(video_path)
     params = dict(sample_fps=sample_fps, width=width, blur_ksize=blur_ksize, diff_threshold=diff_threshold,
                   mog2_history=mog2_history, mog2_var_threshold=mog2_var_threshold,
-                  mog2_learning_rate=mog2_learning_rate, mog2_illum_ncc=mog2_illum_ncc, morph_kernel=morph_kernel,
+                  mog2_learning_rate=mog2_learning_rate, mog2_illum_ncc=mog2_illum_ncc, mog2_color=mog2_color,
+                  morph_kernel=morph_kernel,
                   ignore_polygons=[[list(map(float, p)) for p in poly] for poly in (ignore_polygons or [])],
                   hash_grid=hash_grid, hist_bins=hist_bins)
     cols = ["sample", "frame_idx", "timestamp_s", "score_diff", "score_mog2", "mean_luma"]
@@ -236,13 +251,13 @@ def scan_video(video_path: str | Path, *, sample_fps=5.0, width=320, blur_ksize=
     scorer = None
     t0 = time.perf_counter()
     for idx, frame in iter_sampled_frames(video_path, step):
-        gray, blurred = preprocess(frame, width, blur_ksize)
+        gray, blurred, blurred_c = preprocess(frame, width, blur_ksize, color=True)
         if scorer is None:  # created on the first frame, once we know the processed size
             mask = make_ignore_mask(gray.shape[1], gray.shape[0], params["ignore_polygons"])
             scorer = MotionScorer(diff_threshold, mog2_history, mog2_var_threshold, mog2_learning_rate,
-                                  morph_kernel, mask, mog2_illum_ncc)
+                                  morph_kernel, mask, mog2_illum_ncc, mog2_color)
             n_valid = scorer.valid_pixels(gray.shape)
-        fg_d, fg_m = scorer.update(blurred)
+        fg_d, fg_m = scorer.update(blurred, blurred_c)
         frame_idx.append(idx)
         diff.append(np.count_nonzero(fg_d) / n_valid)  # fraction of pixels moving
         mog.append(np.count_nonzero(fg_m) / n_valid)
@@ -270,26 +285,38 @@ def scan_video(video_path: str | Path, *, sample_fps=5.0, width=320, blur_ksize=
 # ---------------------------------------------------------------------------------------------------
 # Thresholds and segments
 # ---------------------------------------------------------------------------------------------------
-def robust_threshold(scores, k: float = 3.0, floor: float = 0.0) -> float:
+def robust_threshold(scores, k: float = 3.0, floor: float = 0.0, q_noise: float = 0.5) -> float:
     """Adaptive threshold = median + k * 1.4826 * MAD  (never below `floor`).
 
     MAD (median absolute deviation) = median(|x - median(x)|), a measure of spread like the standard
     deviation, but big spikes (the motion we're looking for) barely affect it. 1.4826 * MAD equals
     the standard deviation for normally distributed data, so k=3 means "3 sigma above normal".
-    Assumes most of the video is quiet, so the median describes "nothing happening".
+
+    `q_noise`: median and MAD come only from the quietest `q_noise` share of samples (0.5 = the quieter
+    half). With all samples (q_noise=1.0, the original v1 behaviour) a busy camera breaks it: when
+    something moves more than half the time, the median *is* motion and the threshold rises above
+    real events (on cafe_demo.mp4, v1 marked people walking across the room as inactive). Using the
+    quieter half only assumes that at least that share of the time is "normal background".
+    Taken from the v2 pipeline.
     """
     x = np.asarray(scores, dtype=float)
+    if 0 < q_noise < 1 and x.size:
+        x = x[x <= np.quantile(x, q_noise)]
+    if x.size == 0:
+        return floor
     med = float(np.median(x))
     mad = float(np.median(np.abs(x - med)))
     return max(floor, med + k * 1.4826 * mad)
 
 
 def start_stop_thresholds(scores: pd.DataFrame, which: str, *, threshold_mode="adaptive", k=3.0, floor=0.001,
-                          fixed_threshold=None, stop_ratio=0.5, **_ignored) -> tuple[float, float]:
+                          fixed_threshold=None, stop_ratio=0.5, q_noise=0.5, **_ignored) -> tuple[float, float]:
     """(start, stop) thresholds for the score column score_<which> ("diff" or "mog2").
     **_ignored swallows extra keys, so you can pass the whole SEGMENT_PARAMS dict."""
+    if isinstance(floor, dict):  # per-gate floors, e.g. {"diff": 0.001, "mog2": 0.001, "deep": 0.004}
+        floor = floor.get(which, 0.001)
     if threshold_mode == "adaptive":
-        start = robust_threshold(scores[f"score_{which}"], k, floor)
+        start = robust_threshold(scores[f"score_{which}"], k, floor, q_noise)
     elif threshold_mode == "fixed":
         start = (fixed_threshold or {})[which]
     else:
@@ -364,16 +391,38 @@ def find_segments(scores: pd.DataFrame, score_col: str, *, start_threshold: floa
     return pd.DataFrame(rows, columns=cols)
 
 
-def segment_both_methods(scores: pd.DataFrame, duration_s: float, **segment_params) -> dict:
-    """Thresholds + segments for both scores: {"diff": {...}, "mog2": {...}}, each with start, stop, segments."""
+def segment_methods(scores: pd.DataFrame, duration_s: float, methods=("diff", "mog2"), **segment_params) -> dict:
+    """Thresholds + segments for each score column score_<method>: {"diff": {...}, "mog2": {...}, ...},
+    each with col, start, stop, segments. Any score column works ("deep" too, see gpu_stages.scan_deep)."""
     kw = {k: segment_params[k] for k in ("smooth_s", "merge_gap_s", "min_duration_s", "pad_s")}
     out = {}
-    for m in ("diff", "mog2"):
+    for m in methods:
         start, stop = start_stop_thresholds(scores, m, **segment_params)
         segs = find_segments(scores, f"score_{m}", start_threshold=start, stop_threshold=stop,
                              duration_s=duration_s, **kw)
         out[m] = {"col": f"score_{m}", "start": start, "stop": stop, "segments": segs}
     return out
+
+
+def segment_both_methods(scores: pd.DataFrame, duration_s: float, **segment_params) -> dict:
+    """Thresholds + segments for both scores: {"diff": {...}, "mog2": {...}}, each with start, stop, segments."""
+    return segment_methods(scores, duration_s, ("diff", "mog2"), **segment_params)
+
+
+def add_fused(scores: pd.DataFrame, results: dict, duration_s: float, **segment_params) -> dict:
+    """Fused gate (from the v2 pipeline): each gate's smoothed score divided by its own start threshold
+    (1.0 = "at the threshold"), then the mean of the two highest ratios per sample: a soft
+    "2 of N gates agree" vote. Adds scores["score_fused"] and results["fused"] (start 1.0, stop = stop_ratio)."""
+    period = float(np.median(np.diff(scores["timestamp_s"])))
+    win = max(1, round(segment_params["smooth_s"] / period))
+    ratios = np.vstack([smooth(scores[r["col"]], win) / r["start"] for r in results.values()])
+    scores["score_fused"] = np.sort(ratios, 0)[-2:].mean(0) if len(ratios) > 1 else ratios[0]
+    kw = {k: segment_params[k] for k in ("merge_gap_s", "min_duration_s", "pad_s")}
+    stop = segment_params["stop_ratio"]
+    segs = find_segments(scores, "score_fused", start_threshold=1.0, stop_threshold=stop,
+                         duration_s=duration_s, smooth_s=0.0, **kw)  # already smoothed
+    results["fused"] = {"col": "score_fused", "start": 1.0, "stop": stop, "segments": segs}
+    return results
 
 
 def active_mask(times: np.ndarray, segments: pd.DataFrame) -> np.ndarray:
@@ -413,14 +462,73 @@ def foreground_mask_at(video_path, frame_idx: int, scan_params: dict, method="mo
     start -= start % step  # stay on the same 1-in-6 frame grid as the scan
     scorer, frame, fg, removed = None, None, None, None
     for _, frame in iter_sampled_frames(video_path, step, start_frame=start, end_frame=frame_idx + 1):
-        gray, blurred = preprocess(frame, p["width"], p["blur_ksize"])
+        gray, blurred, blurred_c = preprocess(frame, p["width"], p["blur_ksize"], color=True)
         if scorer is None:
             mask = make_ignore_mask(gray.shape[1], gray.shape[0], p.get("ignore_polygons"))
             scorer = MotionScorer(p["diff_threshold"], p["mog2_history"], p["mog2_var_threshold"],
-                                  p["mog2_learning_rate"], p["morph_kernel"], mask, p.get("mog2_illum_ncc"))
-        fg_d, fg_m = scorer.update(blurred)
+                                  p["mog2_learning_rate"], p["morph_kernel"], mask, p.get("mog2_illum_ncc"),
+                                  p.get("mog2_color", False))
+        fg_d, fg_m = scorer.update(blurred, blurred_c)
         fg, removed = (fg_d, None) if method == "diff" else (fg_m, scorer.last_illum_removed)
     return frame, fg, removed
+
+
+# ---------------------------------------------------------------------------------------------------
+# Ground truth: CSV with one row per event, start_s,end_s[,label] (seconds from the start of the video)
+#   gate_table      per gate: frame precision / recall / F1, event recall (share of GT events a segment
+#                   covers), % of video active
+#   keyframe_hits   per keyframe set: share of GT events with at least one keyframe. The number that
+#                   matters downstream: an event without a keyframe is never captioned or indexed.
+#   gate_agreement  IoU of active time between every pair of gates (no ground truth needed)
+# ---------------------------------------------------------------------------------------------------
+def load_gt(path) -> pd.DataFrame:
+    gt = pd.read_csv(path)
+    missing = {"start_s", "end_s"} - set(gt.columns)
+    if missing:
+        raise ValueError(f"{path}: missing columns {missing} (need start_s,end_s[,label])")
+    return gt
+
+
+def _covered(a, b, segs, iou_thr):
+    """A GT event [a, b] counts as found if one segment covers > half of it, or overlaps it with IoU >= iou_thr."""
+    for s, e in zip(segs.start_s, segs.end_s):
+        inter = max(0.0, min(b, e) - max(a, s))
+        if inter / max(1e-9, b - a) > 0.5 or inter / max(1e-9, max(b, e) - min(a, s)) >= iou_thr:
+            return True
+    return False
+
+
+def gate_table(gt: pd.DataFrame, gates: dict, times: np.ndarray, duration_s: float, iou_thr=0.3) -> pd.DataFrame:
+    """gates: {name: {"segments": DataFrame}} (motion_gating results) or {name: segments DataFrame}."""
+    gt_mask = active_mask(times, gt)
+    rows = {}
+    for name, g in gates.items():
+        segs = g["segments"] if isinstance(g, dict) else g
+        pm = active_mask(times, segs)
+        tp = (pm & gt_mask).sum()
+        prec, rec = tp / max(1, pm.sum()), tp / max(1, gt_mask.sum())
+        rows[name] = {"frame_precision": prec, "frame_recall": rec,
+                      "frame_f1": 2 * prec * rec / max(1e-9, prec + rec),
+                      "event_recall": np.mean([_covered(a, b, segs, iou_thr) for a, b in zip(gt.start_s, gt.end_s)])
+                      if len(gt) else np.nan,
+                      "active_pct": 100 * active_fraction(segs, duration_s)}
+    return pd.DataFrame(rows).T
+
+
+def keyframe_hits(gt: pd.DataFrame, keyframe_times: dict) -> pd.DataFrame:
+    """keyframe_times: {name: array of keyframe timestamps (s)}."""
+    rows = {}
+    for name, kt in keyframe_times.items():
+        kt = np.asarray(kt, float)
+        hit = [bool(np.any((kt >= a) & (kt <= b))) for a, b in zip(gt.start_s, gt.end_s)]
+        rows[name] = {"keyframes": len(kt), "gt_events_with_keyframe": float(np.mean(hit)) if hit else np.nan}
+    return pd.DataFrame(rows).T
+
+
+def gate_agreement(gates: dict, times: np.ndarray) -> pd.DataFrame:
+    masks = {m: active_mask(times, g["segments"] if isinstance(g, dict) else g) for m, g in gates.items()}
+    return pd.DataFrame({a: {b: (masks[a] & masks[b]).sum() / max(1, (masks[a] | masks[b]).sum()) for b in masks}
+                         for a in masks}).T
 
 
 # ---------------------------------------------------------------------------------------------------

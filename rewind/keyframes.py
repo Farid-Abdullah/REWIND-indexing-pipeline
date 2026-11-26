@@ -1,6 +1,6 @@
 """Stage 2: keyframe extraction. Pick a few informative frames from each active segment.
 
-Run:  python keyframes.py [video]      (run motion_gating.py first)
+Run:  python -m rewind.keyframes [video]      (run motion_gating.py first)
 Writes outputs/<video name>/keyframes/*.jpg and keyframes.csv.
 
 Rules, applied to the 5-samples/s frames inside each segment:
@@ -27,7 +27,7 @@ import cv2
 import numpy as np
 import pandas as pd
 
-from video_utils import format_hms, read_frames
+from rewind.utils.video_utils import format_hms, read_frames
 
 # Default parameters (the notebook's config cell uses the same values)
 KEYFRAME_PARAMS = dict(
@@ -246,7 +246,7 @@ def export_keyframes(video_path: str | Path, keyframes: pd.DataFrame, out_dir: s
 def main() -> None:
     # Imported here, not at the top: motion_gating imports this file (for tile_phash), and importing
     # each other at the top would be a circular import.
-    import motion_gating as mg
+    from rewind import motion_gating as mg
 
     ap = argparse.ArgumentParser(description="Stage 2: keyframe extraction (run motion_gating.py first).")
     ap.add_argument("video", nargs="?", default=str(mg.DEFAULT_VIDEO))
@@ -256,7 +256,7 @@ def main() -> None:
     out = mg.output_dir(video)
     seg_csv = out / "segments.csv"
     if not seg_csv.exists():
-        raise SystemExit(f"{seg_csv} not found, run: python motion_gating.py {video}")
+        raise SystemExit(f"{seg_csv} not found, run: python -m rewind.motion_gating {video}")
     segments = pd.read_csv(seg_csv)
     method = segments["method"].iat[0] if len(segments) else "mog2"
     scan = mg.scan_video(video, **mg.SCAN_PARAMS, cache_dir=out / "cache")  # loads from cache
