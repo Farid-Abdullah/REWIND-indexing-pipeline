@@ -4,7 +4,8 @@ Every step that `1_pipeline.ipynb` runs, in order, with every setting, what it d
 lower it, and what it did in our first real run. Written so we can tune the pipeline on purpose instead of by
 guesswork. The method write-up with references is `docs/pipeline.md`; this file is the hands-on companion.
 
-**The run this file describes:** 19 Nov 2026, branch `moreVids`, commit `ea088de`, on the team VM (one L4 GPU
+**The run this file describes:** 19 Nov 2026, branch `moreVids` (since merged into `main`; the repository was then
+called `cctv-motion-gating`), commit `ea088de`, on the team VM (one L4 GPU
 used). 38 videos, 2.00 h of video: 12 MEVA clips (1.0 h) + 26 UCA videos (1.0 h). All default settings.
 Wall time 15.3 min (CPU phase 7.9 min, GPU phase 7.4 min). No video failed.
 Kernel "rewind (5T)" ran **Python 3.13** from `/mnt/5T_storage/clipsExtraction/tools/awsenv`, not the

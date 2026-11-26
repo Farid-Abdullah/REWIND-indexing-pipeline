@@ -3,7 +3,8 @@
 `pipeline_run.ipynb`, `search_run.ipynb` and `explore_run.ipynb` are the notebooks **with their outputs**, as run
 on the VM (one L4, Qwen2.5-VL-7B-Instruct, `selection.csv` = 12 MEVA videos (1.0 h) + 26 UCA val videos (1.0 h)).
 They were run before the repository was reorganised, so their import lines (`import batch`, `import search`, ...)
-are the old ones. The clean, runnable versions are `notebooks/1_pipeline.ipynb`, `2_search.ipynb` and
+are the old ones, and the paths in their outputs show the VM folder under the repository's old name
+(`/mnt/5T_storage/cctv-motion-gating`; the repository is now `REWIND-indexing-pipeline`). The clean, runnable versions are `notebooks/1_pipeline.ipynb`, `2_search.ipynb` and
 `3_explore.ipynb`.
 
 ## What ran

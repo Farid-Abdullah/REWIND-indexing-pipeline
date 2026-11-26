@@ -36,10 +36,13 @@ skip it, the notebooks still find the code as long as they are opened from `note
 
 ```bash
 cd /mnt/5T_storage
-git clone https://github.com/Farid-Abdullah/cctv-motion-gating rewind
+git clone https://github.com/Farid-Abdullah/REWIND-indexing-pipeline rewind
 cd rewind
 pip install -e .              # inside the environment of the notebook kernel
 ```
+
+The repository was called `cctv-motion-gating` until 26 Nov 2026. GitHub redirects the old URL, but an existing
+checkout should point at the new one: `git remote set-url origin https://github.com/Farid-Abdullah/REWIND-indexing-pipeline`.
 
 An existing checkout: `git pull`, then `pip install -e .` once. `outputs/` and `selection.csv` stay where they
 were (the repository folder), so earlier results are still found.
