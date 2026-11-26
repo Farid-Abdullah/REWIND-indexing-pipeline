@@ -304,8 +304,10 @@ video, and keeps clips close to the length of the UCA sentences we will score wi
 visible, never guess identities or intentions, put doubts in `uncertain`. The detector's events and objects are
 stored next to each caption but **not** shown to the VLM, so the two stay independent and can check each other
 later (the Capstone's verification step). How often the captions still mention things that aren't there is
-measured by hand: `caption_review.csv` / `.html` (60 random frames, picture next to caption, columns for
-hallucinated and missed items) and `captions.review_summary()` for the percentages.
+measured in three ways (`caption_eval.py`, `explore.ipynb` section 6): by hand on 30 random clips split over 5
+people (hallucination and miss rate); automatically on every clip against the detector's tracks (mentioned but
+never tracked / tracked but not mentioned, people count); and against the ground-truth labels (sentence-embedding
+similarity to the UCA sentence of the same seconds, against other videos' captions as a baseline).
 
 **Outputs** (`captions/`): `frame_captions.jsonl`, `clip_captions.jsonl` (full JSON + raw answer + timing),
 `captions.csv` (both levels in one table: camera, start/end, wall clock, text, `search_text`, preview image),
@@ -429,7 +431,8 @@ Long activities are caught, short ones are not: `person_talks_to_person` 86 % (1
 2. G421 15:55: the motion score is exactly 0 for the last ~50 s while labelled activity continues. Frozen frames
    or a decoding problem? Open the video and check.
 2b. Run stage 5 on the VM (`pipeline.ipynb`, phases `vlm_clips`, `vlm_frames`): fill in the cost estimate in
-   section 4b (first attempt: ~7 s per clip, 5-10 s per frame on one L4) and hand-check `caption_review.csv`.
+   section 4b (first attempt: ~7 s per clip, 5-10 s per frame on one L4) and do the clip hand check
+   (`explore.ipynb` section 6).
 
 **To decide with experiments** (settings and expected effects: `docs/explanation.md`, "Suggested experiments")
 3. Gate: switch to `diff` or `fused`?

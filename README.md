@@ -120,11 +120,19 @@ Qwen3-VL works too) writes a JSON description of:
 It is told to describe only what it can see. Everything goes to `captions/captions.csv` (one row per frame or clip:
 camera, start/end, clock time, text, `search_text`, preview image). Clips are captioned for every video first
 (phase `vlm_clips`, ~7 s per clip on one L4), then frames (phase `vlm_frames`, ~5-10 s per frame), so an
-interrupted run still leaves every video searchable by clip. The model is loaded once for both. After each caption
-phase, `outputs/batch/caption_review.csv` + `.html` show 60 random frames next to their captions, to count by hand
-how often it mentions things that aren't there (`explore.ipynb` section 6 turns the filled-in sheet into
-percentages). Model: `VLM_MODEL` in `pipeline.ipynb` (the VM's local Qwen2.5-VL-7B folder); needs `torch`,
-`transformers>=4.49` and ~17 GB free on `VLM_DEVICE`. Plumbing check without a GPU: `REWIND_MOCK=1`.
+interrupted run still leaves every video searchable by clip. The model is loaded once for both.
+
+**Caption quality** (`caption_eval.py`, shown in `explore.ipynb` section 6, no re-run needed):
+- *detector cross-check* (automatic, every clip): what a caption mentions (people, vehicles, bags, ...) vs what
+  YOLO-World tracked in the same seconds: likely hallucinations, likely misses, people-count agreement;
+- *labels* (automatic): each UCA sentence / MEVA activity vs the caption of its clip, with a sentence-embedding
+  model (`bge-small`), against other videos' captions as a baseline; plus top-1 / top-5 caption-only search;
+- *hand check*: 30 random clips split over 5 people, `outputs/batch/clip_review/review_<k>.html` (frames next to
+  the caption) + `review_<k>.csv` to fill in; gives the hallucination and miss rate, and how far to trust the
+  detector cross-check. Model: `VLM_MODEL` in `pipeline.ipynb` (the VM's local Qwen2.5-VL-7B folder); needs `torch`,
+`transformers>=4.49` and ~17 GB free on each GPU in `VLM_DEVICE`. `VLM_DEVICE = ["cuda:0", "cuda:1"]` (the default)
+runs one copy of the model per L4, each on about half the video-time, so captioning takes about half as long;
+`"cuda:0"` uses one GPU. Plumbing check without a GPU: `REWIND_MOCK=1`.
 
 Known weak spots (café video): track IDs switch in crowds, so one person can "appear" many times; `crowd` and
 `loitering` fire almost constantly in a busy lobby; X-CLIP rarely passes its threshold. The rules were written for
@@ -133,8 +141,8 @@ outdoor CCTV and need tuning per scene.
 ## Outputs (`outputs/batch/<dataset>/<video name>/`)
 
 Batch-level files in `outputs/batch/`: `batch_summary.csv` (one row per video, every number below), `selection_used.csv`,
-`batch_config.json`, `run_log.txt` (everything the run printed, with times), `caption_review.csv` / `.html` (hand
-check of caption quality). Per video, `summary_cpu.json` / `summary_gpu.json` hold that video's row, and `gt.csv` the
+`batch_config.json`, `run_log.txt` (everything the run printed, with times), `clip_review/` (hand-check sheets,
+made by `explore.ipynb`). Per video, `summary_cpu.json` / `summary_gpu.json` hold that video's row, and `gt.csv` the
 labelled items with a `has_keyframe` column.
 
 

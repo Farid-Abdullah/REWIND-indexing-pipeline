@@ -289,6 +289,100 @@ def run_vlm(row, cfg, captioner, levels, force=False) -> dict:
     return cap.caption_video(out_dir(cfg, row), captioner, force=force, levels=levels)
 
 
+def vlm_devices(cfg) -> list:
+    """CFG["vlm"]["device"] as a list: "cuda:0" -> ["cuda:0"], ["cuda:0", "cuda:1"] stays."""
+    import captions as cap
+    dev = {**cap.CAPTION_CONFIG, **cfg.get("vlm", {})}["device"]
+    return list(dev) if isinstance(dev, (list, tuple)) else [dev]
+
+
+def split_by_duration(rows: list, k: int) -> list[list]:
+    """Videos into k groups of about equal total duration (longest first, each to the least-loaded group)."""
+    groups, load = [[] for _ in range(k)], [0.0] * k
+    for r in sorted(rows, key=lambda r: -float(r["duration_s"] or 0)):
+        j = load.index(min(load))
+        groups[j].append(r)
+        load[j] += float(r["duration_s"] or 0)
+    return groups
+
+
+def caption_one(row, cfg, captioner, phase, force, tag, log) -> None:
+    """One video, one caption level; logs one line, writes error_<phase>.json on failure."""
+    out = out_dir(cfg, row)
+    t0 = time.perf_counter()
+    try:
+        s = run_vlm(row, cfg, captioner, VLM_PHASES[phase], force)
+        level = VLM_PHASES[phase][0]
+        new, have = s[f"vlm_{level}_new"], s[f"vlm_{level}"]
+        msg = (f"{have} {level} captioned ({new} new, from {s['vlm_source']}), {s['vlm_parse_failed']} unparsed"
+               if new or have else "nothing to caption")
+        (out / f"error_{phase}.json").unlink(missing_ok=True)
+        log(f"{tag}: {msg}  [{time.perf_counter() - t0:.0f} s]")
+    except Exception as e:
+        out.mkdir(parents=True, exist_ok=True)
+        _write_json(out / f"error_{phase}.json", {f"status_{phase}": f"error: {e!r}"[:300],
+                                                  f"traceback_{phase}": traceback.format_exc()[-2000:]})
+        log(f"{tag}: ERROR {e!r}  (details in {out / f'error_{phase}.json'})")
+
+
+def _vlm_worker(name, device, jobs, cfg, phase, force, queue) -> None:
+    """Runs in its own process: one VLM on `device`, captions its share of the videos, sends log lines back."""
+    try:
+        import captions as cap
+
+        def log(msg):
+            queue.put(("log", f"[{name}] {msg}"))
+        cap.log = lambda m: log(f"[captions] {m}")   # caption_video's progress lines go to the notebook too
+        captioner = cap.Captioner({**cfg["vlm"], "device": device})
+        for tag, row in jobs:
+            caption_one(row, cfg, captioner, phase, force, tag, log)
+            queue.put(("video_done", name))
+    except Exception as e:  # report, don't hang the notebook
+        queue.put(("log", f"[{name}] WORKER ERROR {e!r}\n{traceback.format_exc()[-1500:]}"))
+    finally:
+        queue.put(("worker_done", name))
+
+
+def caption_parallel(selection, cfg, phase, force, devices, log) -> None:
+    """One worker process per GPU, each with its own copy of the VLM and about half (1/k) of the video-time."""
+    import multiprocessing as mp
+    import queue as queue_mod
+    n = len(selection)
+    rows = [dict(r, _tag=f"[{i}/{n}] {r['dataset']}/{r['video_id']}")
+            for i, r in enumerate(selection.to_dict("records"), 1)]
+    groups = split_by_duration(rows, len(devices))
+    ctx = mp.get_context("spawn")   # CUDA can't be forked; spawn works from Jupyter too
+    q = ctx.Queue()
+    procs = []
+    names = [d if devices.count(d) == 1 else f"{d}#{i}" for i, d in enumerate(devices)]
+    for name, dev, grp in zip(names, devices, groups):
+        h = sum(float(r["duration_s"] or 0) for r in grp) / 3600
+        log(f"{name}: {len(grp)} videos, {h:.2f} h (loading its own copy of the VLM)")
+        jobs = [(r.pop("_tag"), r) for r in grp]
+        p = ctx.Process(target=_vlm_worker, args=(name, dev, jobs, cfg, phase, force, q), daemon=True)
+        p.start()
+        procs.append((name, p))
+    running = {name for name, _ in procs}
+    while running:
+        try:
+            kind, payload = q.get(timeout=5)
+        except queue_mod.Empty:
+            for dev, p in procs:   # a worker killed from outside (e.g. out of RAM) sends nothing
+                if dev in running and not p.is_alive():
+                    log(f"[{dev}] worker stopped unexpectedly (exit code {p.exitcode}); its remaining videos "
+                        f"were not captioned. Re-run the cell (FRESH_RUN = False) to continue.")
+                    running.discard(dev)
+            continue
+        if kind == "log":
+            log(payload)
+        elif kind == "video_done":
+            collect_summary(cfg, selection)
+        elif kind == "worker_done":
+            running.discard(payload)
+    for _, p in procs:
+        p.join(timeout=30)
+
+
 def free_gpu_memory(models=None) -> None:
     """Drop the phase-2 models (if any) and return cached GPU memory before the VLM loads (~16 GB of 24)."""
     if models is not None:
@@ -397,7 +491,8 @@ def run_batch(selection: pd.DataFrame, cfg: dict | None = None, stages=("cpu", "
     """Run the given phases over every selected video, in the order cpu, gpu, vlm_clips, vlm_frames.
     cpu / gpu skip videos that finished before (unless force). The caption phases always look at every
     video, but caption only what is missing (per frame / per clip), so they resume where they stopped.
-    Pass `captioner` (captions.Captioner) to reuse a loaded VLM between calls."""
+    Pass `captioner` (captions.Captioner) to reuse a loaded VLM between calls. If CFG["vlm"]["device"] is a list
+    of GPUs, each caption phase runs one worker process per GPU instead (each loads its own VLM; `captioner` unused)."""
     cfg = merged_cfg(cfg)
     phases = expand_stages(stages)
     cfg["out_root"].mkdir(parents=True, exist_ok=True)
@@ -416,9 +511,19 @@ def run_batch(selection: pd.DataFrame, cfg: dict | None = None, stages=("cpu", "
         models = gs.Models(v2)
         log(f"GPU stages: device {models.device}" + ("  (MOCK MODELS)" if models.mock else ""))
 
+    devices = vlm_devices(cfg)
     for phase in phases:
         log(f"\n=== phase {phase.upper()} ===")
         is_vlm = phase in VLM_PHASES
+        if is_vlm and len(devices) > 1:   # one VLM per GPU, in worker processes
+            free_gpu_memory(models)
+            models = None
+            t_phase = time.perf_counter()
+            log(f"captioning {VLM_PHASES[phase][0]} on {len(devices)} GPUs: {', '.join(devices)}")
+            caption_parallel(selection, cfg, phase, force, devices, log)
+            log(f"phase {phase.upper()} took {(time.perf_counter() - t_phase) / 60:.1f} min")
+            collect_summary(cfg, selection)
+            continue
         if is_vlm and captioner is None:
             import captions as cap
             free_gpu_memory(models)
@@ -436,15 +541,13 @@ def run_batch(selection: pd.DataFrame, cfg: dict | None = None, stages=("cpu", "
                 if done and str(done.get(f"status_{phase}", "")).startswith(("ok", "no segments")) and not force:
                     log(f"{tag}: done before, skipped")
                     continue
+            if is_vlm:
+                caption_one(row, cfg, captioner, phase, force, tag, log)
+                collect_summary(cfg, selection)
+                continue
             t0 = time.perf_counter()
             try:
-                if is_vlm:
-                    s = run_vlm(row, cfg, captioner, VLM_PHASES[phase], force)
-                    new = s["vlm_clips_new"] if phase == "vlm_clips" else s["vlm_frames_new"]
-                    have = s["vlm_clips"] if phase == "vlm_clips" else s["vlm_frames"]
-                    msg = (f"{have} {VLM_PHASES[phase][0]} captioned ({new} new, from {s['vlm_source']}), "
-                           f"{s['vlm_parse_failed']} unparsed" if new or have else "nothing to caption")
-                elif phase == "cpu":
+                if phase == "cpu":
                     s = run_cpu(row, cfg, models)
                     msg = (f"{s['duration_s'] / 60:.1f} min, {s['active_pct']:.0f}% active, {s['keyframes']} kf "
                            f"({s['reduction_x']:.0f}x fewer)" +
@@ -463,11 +566,6 @@ def run_batch(selection: pd.DataFrame, cfg: dict | None = None, stages=("cpu", "
                 log(f"{tag}: ERROR {e!r}  (details in {out / f'error_{phase}.json'})")
             collect_summary(cfg, selection)
         log(f"phase {phase.upper()} took {(time.perf_counter() - t_phase) / 60:.1f} min")
-        if is_vlm:
-            import captions as cap
-            sheet = cap.make_review_sheet(cfg["out_root"], cfg.get("review_n", 60))
-            if sheet:
-                log(f"caption hand-check sheet: {sheet} (+ caption_review.html)")
     return collect_summary(cfg, selection)
 
 

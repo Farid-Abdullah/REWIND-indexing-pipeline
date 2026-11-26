@@ -40,5 +40,5 @@ so roughly 3 hours of video per compute-hour.
 4. **Details that may be invented:** e.g. "a purple jacket with a number 14", which can't be confirmed at this
    resolution. That's what the hand check is for.
 5. **No hand-check sheet yet:** it samples frame captions, and the frame phase was stopped.
-6. **Recall of the "notable" field is low:** 4 of the 22 non-normal UCA videos were flagged (no arson, robbery,
+6. **Recall of the "notable" field is low:** 4 of the 24 non-normal UCA videos were flagged (no arson, robbery,
    shooting, shoplifting, stealing or vandalism clip was).

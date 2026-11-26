@@ -486,15 +486,19 @@ isn't valid JSON is kept as plain text (`parse_ok=False`) so the frame stays sea
 | `max_new_tokens_frame` / `_clip` | 400 / 500 | fewer cut-off JSON answers in busy scenes | faster |
 | `review_n` (top level of `CFG`) | 60 | tighter hallucination estimate | quicker hand check |
 
-Also in the config cell: `VLM_MODEL` (local Qwen folder on the VM), `VLM_DEVICE` (`cuda:0` / `cuda:1`, whichever
-L4 has ~17 GB free; the pre-flight cell shows it), and `STAGES` (drop `"vlm_frames"` to skip the slow part).
+Also in the config cell: `VLM_MODEL` (local Qwen folder on the VM), `VLM_DEVICE` and `STAGES` (drop
+`"vlm_frames"` to skip the slow part). `VLM_DEVICE = ["cuda:0", "cuda:1"]` (default) starts one worker process per
+L4, each with its own copy of the model (~17 GB each) and about half the video-time: about 2x faster. Log lines are
+tagged `[cuda:0]` / `[cuda:1]`. Use a single `"cuda:0"` or `"cuda:1"` when the other group needs a card; the
+pre-flight cell shows each card's free memory. Each phase loads the model again in its workers (~1 min).
 Changing any caption setting except `batch_size` makes `settings_hash` change, and that video's captions are made
 again. Same settings → only missing clips / frames are captioned (`FRESH_RUN = False` continues a stopped run).
 
 **What to look at after a run:** `explore.ipynb` section 5 (one video's clips next to their frames and the labels
 of the same span) and section 6 (unparsed answers, s per clip / frame, estimated VLM minutes per video-hour, clips
-flagged as unusual). Then open `outputs/batch/caption_review.html`, fill in `caption_review.csv`, and re-run the
-last cell of section 6 for the hallucination rate.
+flagged as unusual), then the three quality checks: detector cross-check, captions vs labels, and the hand check
+(`outputs/batch/clip_review/review_<k>.html` + `.csv`, 30 clips over 5 people; re-run the last cell of section 6 for
+the hallucination and miss rate).
 
 ---
 
@@ -520,7 +524,7 @@ last cell of section 6 for the hallucination rate.
 | `summary_vlm.json`, `error_vlm_clips.json`, `error_vlm_frames.json` | batch | stage 5's row / errors |
 
 Batch level (`outputs/batch/`): `batch_summary.csv`, `selection_used.csv`, `batch_config.json`,
-`caption_review.csv` + `caption_review.html` (hand check of caption quality).
+`clip_review/review_<k>.csv` + `.html` (hand check of caption quality, made by `explore.ipynb`).
 
 ---
 

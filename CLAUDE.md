@@ -45,12 +45,13 @@ For a plumbing check without the VM's data, `REWIND_DATA_ROOT`, `REWIND_OUT_ROOT
 |---|---|
 | `pipeline.ipynb` | The run: pre-flight check (GPU via torch, `sentencepiece`, `ultralytics`, VLM folder), `FRESH_RUN` (`batch.clean_outputs`), then one cell per phase via `batch.run_batch`; logs to `outputs/batch/run_log.txt`; prints only. Committed **without** outputs |
 | `explore.ipynb` | Reads `outputs/batch/` and shows everything (overview, per video, MEVA multi-camera, GT misses, events, captions next to their frames and labels, caption speed / hand check, run times). Committed **without** outputs |
-| `batch.py` | Phases `cpu`, `gpu`, `vlm_clips`, `vlm_frames` (`"vlm"` = both), each over all videos; cpu/gpu skip finished videos, caption phases resume per item; `clean_outputs`, `make_logger`, per-video `error_<phase>.json`, `batch_summary.csv` |
+| `batch.py` | Phases `cpu`, `gpu`, `vlm_clips`, `vlm_frames` (`"vlm"` = both), each over all videos; cpu/gpu skip finished videos, caption phases resume per item; a list in `CFG["vlm"]["device"]` = one spawned worker per GPU (`caption_parallel`, videos split by duration, log lines relayed through a queue); `clean_outputs`, `make_logger`, per-video `error_<phase>.json`, `batch_summary.csv` |
 | `datasets.py` | MEVA / UCA discovery, ~1 h selection per dataset, ground truth (MEVA `*.activities.yml` frames / fps; UCA sentences) |
 | `motion_gating.py` | Stage 1: frame diff + MOG2 (colour, NCC lighting filter), adaptive threshold on the quieter half, hysteresis segments, fused gate (`add_fused`); ground-truth checks (`gate_table`, `keyframe_hits`, `gate_agreement`) |
 | `keyframes.py` | Stage 2: first / peak / change (4x4 tile pHash) / maxgap keyframes, dedup, idle heartbeat |
 | `gpu_stages.py` | From Muzayyan's v2 (LLM-written): `Models` (lazy, skip on failure), DINOv2 gate (`scan_deep`), stage 3 events, stage 4 samplers, `write_index_records` |
 | `captions.py` | Stage 5: Qwen-VL JSON captions per selected frame and per clip (segment cut into <= 60 s), resume by `settings_hash`, `MockVL`, `caption_review.csv` hand-check sheet |
+| `caption_eval.py` | Caption quality on saved outputs (explore.ipynb section 6): `detector_crosscheck` (caption mentions vs YOLO tracks per clip), `label_similarity` (GT label vs covering clip caption, `TextEmbedder` = bge-small with TF-IDF fallback, shared with the search), `make_review_sheets` / `review_results` (hand check in `outputs/batch/clip_review/`, never overwrites filled sheets; clip ids written as `c001.0` so Excel keeps them) |
 | `video_utils.py`, `visualize.py` | Frame reading; plots, GIFs, tracker-box drawing |
 | `docs/pipeline.md` | Method write-up with references and the latest batch results; keep it in sync when a step or default changes |
 | `docs/explanation.md` | Step-by-step tuning guide: every setting, its default, what raising/lowering it does, what ran / was skipped in the last run |

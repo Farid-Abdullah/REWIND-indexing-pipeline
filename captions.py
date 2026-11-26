@@ -19,8 +19,8 @@ Two levels, both written to <video folder>/captions/:
 
 Every record also gets `search_text` (all the fields joined into one string) for a keyword or text-
 embedding search. The model is told to describe only what it can see and to put doubts in `uncertain`,
-because results are used as evidence and must not invent things; caption_review.csv lets you check that
-by hand (supervisor's "how often does the VLM mention something that isn't there").
+because results are used as evidence and must not invent things; caption_eval.py checks that (hand check of
+clip captions, detector cross-check, comparison with the labels; explore.ipynb section 6).
 
 Resume: records already captioned with the same settings (model, prompts, image size) are kept; change a
 setting and that video is captioned again. Model weights: any Qwen2.5-VL / Qwen3-VL checkpoint, by Hugging
@@ -48,7 +48,7 @@ ROOT = Path(__file__).resolve().parent
 
 CAPTION_CONFIG = {
     "model": "Qwen/Qwen2.5-VL-7B-Instruct",   # HF name or local folder; Qwen3-VL works too (e.g. Qwen3-VL-8B-Instruct)
-    "device": "auto",              # "auto" (cuda if available) | "cuda" | "cuda:1" | "cpu"
+    "device": "auto",              # "auto" | "cuda:0" | "cuda:1" | "cpu"; a list (["cuda:0", "cuda:1"]) = one model per GPU (batch.py)
     "dtype": "bfloat16",           # L4 supports bf16; 7B in bf16 ~ 16 GB of the 24 GB
     "levels": ["frames", "clips"],
     "source": "auto",              # frames to caption: "index" (stage 4) | "keyframes" (stage 2) | "auto" = index if present
@@ -131,6 +131,8 @@ class QwenVL:
         if device == "auto":
             device = "cuda" if torch.cuda.is_available() else "cpu"
         self.device = device
+        if device.startswith("cuda"):
+            torch.cuda.set_device(torch.device(device))   # so nothing lands on cuda:0 when captioning on cuda:1
         dt = getattr(torch, dtype) if device != "cpu" else torch.float32
         # `dtype=` replaced `torch_dtype=` in 4.56; an unknown keyword would be ignored and load in fp32 (OOM on an L4)
         kw = {"dtype": dt} if version.parse(transformers.__version__) >= version.parse("4.56") else {"torch_dtype": dt}
@@ -151,7 +153,7 @@ class QwenVL:
 
     def peak_vram_gb(self) -> float | None:
         if self.device.startswith("cuda"):
-            return round(self.torch.cuda.max_memory_allocated() / 1e9, 2)
+            return round(self.torch.cuda.max_memory_allocated(self.torch.device(self.device)) / 1e9, 2)
         return None
 
 
@@ -187,6 +189,9 @@ class Captioner:
 
     def __init__(self, cfg: dict | None = None):
         self.cfg = {**CAPTION_CONFIG, **(cfg or {})}
+        dev = self.cfg["device"]
+        self.devices = list(dev) if isinstance(dev, (list, tuple)) else [dev]
+        self.cfg["device"] = self.devices[0]   # this object uses one GPU; batch.py starts one worker per device
         self._vl = None
         self.load_s = 0.0
 
@@ -473,6 +478,8 @@ def caption_video(vdir: str | Path, captioner: Captioner, force: bool = False,
     if "frames" in levels:
         done = {} if force else _load_done(fpath, "frame_idx", h)
         todo = [r for r in frames.itertuples() if int(r.frame_idx) not in done and int(r.frame_idx) not in bad]
+        if todo:
+            captioner.vl   # load the model first: if it fails, the existing file is left untouched
         _rewrite(fpath, [done[k] for k in sorted(done)])
         t0 = time.perf_counter()
         bs = max(1, int(c["batch_size"]))
@@ -513,9 +520,11 @@ def caption_video(vdir: str | Path, captioner: Captioner, force: bool = False,
     cpath = cap_dir / "clip_captions.jsonl"
     if "clips" in levels:
         done = {} if force else _load_done(cpath, "clip_id", h)
+        todo = [r for r in clips.itertuples() if r.clip_id not in done]
+        if todo:
+            captioner.vl   # load the model first: if it fails, the existing file is left untouched
         _rewrite(cpath, [done[k] for k in sorted(done)])
         t0 = time.perf_counter()
-        todo = [r for r in clips.itertuples() if r.clip_id not in done]
         for j, r in enumerate(todo):
             idx = [i for i in clip_idx[r.clip_id] if i not in bad]
             if not idx:
