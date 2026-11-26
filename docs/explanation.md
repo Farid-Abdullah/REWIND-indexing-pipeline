@@ -34,7 +34,7 @@ Conventions: `NAME=value` is a setting and its default. "Config" means the confi
 | 4. Stage-4 JPGs | ⚠️ **none written** | `export_jpgs=["kcenter"]` and kcenter didn't run |
 | 4. Hand-off `index_records.jsonl` | ⚠️ written, **without embeddings** | `index_embeddings.npy` is empty; `embedding_row` points nowhere; `siglip_tag` is empty |
 | Coverage / redundancy metrics | ⚠️ NaN | need embeddings |
-| 5. Captions (VLM) | ⏭️ **not in this run** | `captions.py` was added on 26 Nov; tested only with a fake captioner. Run `STAGES=["vlm"]` |
+| 5. Captions (VLM) | ⏭️ **not in this run** | `captions.py` was added on 26 Nov; tested only with a fake captioner. Phases `vlm_clips`, `vlm_frames` of `pipeline.ipynb` |
 
 So after this run we have segments, keyframes, tracks and a ground-truth check, but **no search embeddings yet**.
 Installing `sentencepiece` and re-running only the GPU phase (`STAGES=["gpu"]`, `FORCE=True`) fixes most of the
@@ -459,15 +459,18 @@ stage 2: a few more frames, a few more hits, no better than even spacing.
 
 This is what the Postgres + pgvector database will ingest. Without embeddings it can't be searched yet.
 
-## Stage 5: captions (`captions.py`, run by `batch.run_vlm`) — not run yet
+## Stage 5: captions (`captions.py`, phases `vlm_clips` then `vlm_frames`) — not run yet
 
-Added 26 Nov 2026 after the run above; tested only with a fake captioner (`"mock": True`), so the real model's
-speed and caption quality are still unknown. Method and reasons: `docs/pipeline.md` section 4b.
+Added 26 Nov 2026 after the run above; tested only with a fake captioner (`REWIND_MOCK=1`), so the real model's
+quality is still unknown. A first real attempt measured ~7 s per clip and 5-10 s per frame (batch 4) on one L4.
+Method and reasons: `docs/pipeline.md` section 4b.
 
-**What it does, per video:** decode every frame it needs once and save it at model size in `captions/frames/`,
-then (1) one VLM call per selected frame (batched), (2) one VLM call per clip (≤ 6 frames in time order). Each
-answer is parsed as JSON; an answer that isn't valid JSON is kept as plain text (`parse_ok=False`) so the frame
-stays searchable.
+**What it does:** phase `vlm_clips` goes over every video and makes one VLM call per clip (≤ 6 frames in time
+order); then phase `vlm_frames` goes over every video again and makes one call per selected frame (`batch_size`
+frames per call). Clips first because they are what a search returns and they are far fewer, so an interrupted run
+still leaves every video searchable. The model is loaded once (`captions.Captioner`) and shared by both phases.
+Frames are decoded once and saved at model size in `captions/frames/`. Each answer is parsed as JSON; an answer that
+isn't valid JSON is kept as plain text (`parse_ok=False`) so the frame stays searchable.
 
 | Setting (`CFG["vlm"]`, defaults in `captions.CAPTION_CONFIG`) | Default | Raise it → | Lower it → |
 |---|---|---|---|
@@ -479,16 +482,19 @@ stays searchable.
 | `clip_max_frames` | 6 | sees more of a long clip; slower, more VRAM | faster; may miss short actions |
 | `clip_min_frames` | 3 | more evenly spaced filler frames | trusts stage 2/4's choice more |
 | `clip_max_s` | 60 s | fewer, longer clips; coarser timestamps | more clips, finer timestamps, more calls |
-| `batch_size` | 4 | faster if VRAM allows | use 1-2 if CUDA runs out of memory |
+| `batch_size` | 8 in `pipeline.ipynb` (4 in the code) | faster per frame if VRAM allows | 4 or 2 if CUDA runs out of memory |
 | `max_new_tokens_frame` / `_clip` | 400 / 500 | fewer cut-off JSON answers in busy scenes | faster |
 | `review_n` (top level of `CFG`) | 60 | tighter hallucination estimate | quicker hand check |
 
-Changing any setting except `batch_size` and `levels` makes `settings_hash` change, and the next run captions
-that video again. Same settings → finished videos are skipped and an interrupted video continues where it stopped.
+Also in the config cell: `VLM_MODEL` (local Qwen folder on the VM), `VLM_DEVICE` (`cuda:0` / `cuda:1`, whichever
+L4 has ~17 GB free; the pre-flight cell shows it), and `STAGES` (drop `"vlm_frames"` to skip the slow part).
+Changing any caption setting except `batch_size` makes `settings_hash` change, and that video's captions are made
+again. Same settings → only missing clips / frames are captioned (`FRESH_RUN = False` continues a stopped run).
 
-**What to look at after a run:** `vlm_parse_failed` in `batch_summary.csv` (should be ~0), `vlm_s_per_frame`,
-`vlm_min_per_video_hour` and `vlm_peak_vram_gb` (for the report's indexing-speed number), then open
-`outputs/batch/caption_review.html` next to `caption_review.csv` and fill in the empty columns.
+**What to look at after a run:** `explore.ipynb` section 5 (one video's clips next to their frames and the labels
+of the same span) and section 6 (unparsed answers, s per clip / frame, estimated VLM minutes per video-hour, clips
+flagged as unusual). Then open `outputs/batch/caption_review.html`, fill in `caption_review.csv`, and re-run the
+last cell of section 6 for the hallucination rate.
 
 ---
 
@@ -511,7 +517,7 @@ that video again. Same settings → finished videos are skipped and an interrupt
 | `captions/frame_captions.jsonl`, `clip_captions.jsonl` | 5 | one JSON record per frame / clip: fields, `search_text`, raw answer, timing |
 | `captions/captions.csv` | 5 | both levels in one table (camera, start/end, wall clock, text, `search_text`, image): what a search reads |
 | `captions/frames/*.jpg` | 5 | the frames at the size the VLM saw them |
-| `summary_vlm.json`, `error_vlm.json` | batch | stage 5's row / error |
+| `summary_vlm.json`, `error_vlm_clips.json`, `error_vlm_frames.json` | batch | stage 5's row / errors |
 
 Batch level (`outputs/batch/`): `batch_summary.csv`, `selection_used.csv`, `batch_config.json`,
 `caption_review.csv` + `caption_review.html` (hand check of caption quality).
@@ -563,7 +569,7 @@ Each is a config change + re-run. Compare in `explore.ipynb` sections 1 and 3 ag
 | 4 | `q_noise=0.2` or `k=2.0` | busy scenes get segments where crowds move | segments + keyframes |
 | 5 | `mog2_illum_ncc=0.8` / `None` | fewer real people removed near windows | full scan (re-decode) |
 | 6 | X-CLIP: margin over background instead of 0.35 | X-CLIP events appear (or decide to drop it) | GPU phase |
-| 7 | `STAGES=["vlm"]` on 2-3 videos first, then all | first captions, s/frame, VRAM; then the hand check | VLM phase only |
+| 7 | `FRESH_RUN=False`, `STAGES=["vlm_clips"]` | captions for every clip, s/clip, VRAM; then the hand check | clip captions only |
 | 8 | `CFG["vlm"]["model"]` = a 3B model, compare the review sheet | speed vs caption quality | VLM phase only |
 
 Changing a stage-1 scan setting (1.1-1.3 tables) re-decodes every video (≈8 min for 2 h); changing thresholds,

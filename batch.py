@@ -1,24 +1,23 @@
 """Run the pipeline on many videos and save everything to disk (no pictures; explore.ipynb shows them).
 
-Used by pipeline.ipynb (config cell + Run All). Also runs from a terminal, e.g. inside tmux so it survives
-a closed laptop:
+Main way to run it: pipeline.ipynb (config cell, then Run All). The same functions also run from a terminal:
 
-    python batch.py                    # selection.csv (made on first run), CPU stages then GPU stages
+    python batch.py --fresh            # delete old results, then every phase on selection.csv
     python batch.py --stages cpu       # only stages 1-2
     python batch.py --stages vlm       # only captions (needs phase 1; uses phase 2's frames if they exist)
-    python batch.py --force            # redo videos that already have results
 
-Three phases, so a GPU problem can't cost you the CPU results:
-  phase 1 (CPU, every video): stage 1 motion gating -> stage 2 keyframes -> ground-truth checks
-  phase 2 (GPU, every video): stage 3 events (YOLO-World + ByteTrack, SigLIP, X-CLIP) -> stage 4 frame
-                               selection -> index_records.jsonl + index_embeddings.npy
-  phase 3 (VLM, every video): stage 5 captions (captions.py): one per selected frame + one per clip
-                               -> captions/captions.csv; then caption_review.csv for a hand check
+Phases, in this order, each over every video, so a later problem can't cost you earlier results:
+  cpu         stage 1 motion gating -> stage 2 keyframes -> ground-truth checks
+  gpu         stage 3 events (YOLO-World + ByteTrack, SigLIP, X-CLIP) -> stage 4 frame selection
+              -> index_records.jsonl + index_embeddings.npy
+  vlm_clips   stage 5 captions, one per clip (segment cut into <= 60 s): the unit a search returns
+  vlm_frames  stage 5 captions, one per selected frame (slow: ~5-10 s per frame on one L4)
 Each video is wrapped in try/except: one broken file is logged and skipped, the batch goes on.
-Finished videos are skipped on a re-run (resume), unless force=True.
+cpu / gpu skip finished videos on a re-run (unless force=True); the caption phases resume per clip / frame.
 
-Outputs: outputs/batch/<dataset>/<video>/  (same files as the single-video notebook, see README)
+Outputs: outputs/batch/<dataset>/<video>/  (see README)
          outputs/batch/batch_summary.csv    (one row per video, updated after every video)
+         outputs/batch/run_log.txt          (everything the run printed, with times)
 """
 
 from __future__ import annotations
@@ -282,16 +281,18 @@ def run_gpu(row, cfg, models, v2) -> dict:
 # ---------------------------------------------------------------------------------------------------
 # Phase 3: VLM captions for one video (reads phase 1's files, and phase 2's if they exist)
 # ---------------------------------------------------------------------------------------------------
-def run_vlm(row, cfg, captioner, force=False) -> dict:
+VLM_PHASES = {"vlm_clips": ["clips"], "vlm_frames": ["frames"]}   # "vlm" = both, clips first
+
+
+def run_vlm(row, cfg, captioner, levels, force=False) -> dict:
     import captions as cap
-    return cap.caption_video(out_dir(cfg, row), captioner, force=force)
+    return cap.caption_video(out_dir(cfg, row), captioner, force=force, levels=levels)
 
 
-def _free_gpu_models(models) -> None:
-    """Drop the phase-2 models before the VLM loads (it needs ~16 GB of the L4's 24 GB)."""
-    if models is None:
-        return
-    models._cache.clear()
+def free_gpu_memory(models=None) -> None:
+    """Drop the phase-2 models (if any) and return cached GPU memory before the VLM loads (~16 GB of 24)."""
+    if models is not None:
+        models._cache.clear()
     try:
         import gc
         import torch
@@ -316,14 +317,74 @@ def _nearest_candidates(meta, kf):
 # ---------------------------------------------------------------------------------------------------
 # The batch
 # ---------------------------------------------------------------------------------------------------
+PHASES = ("cpu", "gpu", "vlm_clips", "vlm_frames")
+SUMMARY_FILES = ("summary_cpu.json", "summary_gpu.json", "summary_vlm.json",
+                 "error_cpu.json", "error_gpu.json", "error_vlm_clips.json", "error_vlm_frames.json")
+
+
+def expand_stages(stages) -> list[str]:
+    """"vlm" -> both caption passes; keeps the fixed order cpu, gpu, vlm_clips, vlm_frames."""
+    want = set()
+    for st in stages:
+        want |= set(VLM_PHASES) if st == "vlm" else {st}
+    bad = want - set(PHASES)
+    if bad:
+        raise ValueError(f"unknown stage(s) {sorted(bad)}; use {list(PHASES) + ['vlm']}")
+    return [p for p in PHASES if p in want]
+
+
+def clean_outputs(out_root, keep_decode_cache: bool = False, log=print) -> None:
+    """Fresh start: delete the batch's results under out_root (every <dataset>/<video>/ folder and the
+    batch-level files). keep_decode_cache=True keeps each video's cache/ (stage 1's slow decode pass;
+    it is keyed by the scan settings, so it can't give stale results, but stage 1 times then read ~0)."""
+    import shutil
+    out_root = Path(out_root).resolve()
+    if not out_root.exists():
+        return
+    if out_root == Path(out_root.anchor) or out_root == Path.home().resolve() or out_root == ROOT:
+        raise ValueError(f"refusing to clean {out_root}")
+    n = 0
+    for child in out_root.iterdir():
+        if child.is_dir():
+            for vd in child.iterdir():   # <dataset>/<video>
+                if not vd.is_dir():
+                    vd.unlink()
+                    continue
+                for item in vd.iterdir():
+                    if keep_decode_cache and item.name == "cache":
+                        continue
+                    shutil.rmtree(item) if item.is_dir() else item.unlink()
+                if not any(vd.iterdir()):
+                    vd.rmdir()
+                n += 1
+            if not any(child.iterdir()):
+                child.rmdir()
+        else:
+            child.unlink()
+    log(f"fresh start: cleared {n} video folders in {out_root}" + (" (decode cache kept)" if keep_decode_cache else ""))
+
+
+def make_logger(path):
+    """print() + append to a log file with the time, so a run can be followed (`tail -f`) or read after the
+    notebook lost its connection."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    def log(msg: str) -> None:
+        print(msg, flush=True)
+        with open(path, "a") as f:
+            for line in str(msg).splitlines() or [""]:
+                f.write(f"{datetime.now():%H:%M:%S} {line}\n")
+    return log
+
+
 def collect_summary(cfg, selection: pd.DataFrame) -> pd.DataFrame:
     """One row per selected video from the summary_*.json files on disk (also works for a half-done batch)."""
     rows = []
     for _, row in selection.iterrows():
         out = out_dir(cfg, row)
         r = {"dataset": row["dataset"], "video_id": row["video_id"]}
-        for f in ("summary_cpu.json", "summary_gpu.json", "summary_vlm.json",
-                  "error_cpu.json", "error_gpu.json", "error_vlm.json"):
+        for f in SUMMARY_FILES:
             r.update(_read_json(out / f) or {})
         rows.append(r)
     df = pd.DataFrame(rows)
@@ -332,46 +393,57 @@ def collect_summary(cfg, selection: pd.DataFrame) -> pd.DataFrame:
 
 
 def run_batch(selection: pd.DataFrame, cfg: dict | None = None, stages=("cpu", "gpu", "vlm"), force=False,
-              log=print) -> pd.DataFrame:
+              log=print, captioner=None) -> pd.DataFrame:
+    """Run the given phases over every selected video, in the order cpu, gpu, vlm_clips, vlm_frames.
+    cpu / gpu skip videos that finished before (unless force). The caption phases always look at every
+    video, but caption only what is missing (per frame / per clip), so they resume where they stopped.
+    Pass `captioner` (captions.Captioner) to reuse a loaded VLM between calls."""
     cfg = merged_cfg(cfg)
+    phases = expand_stages(stages)
     cfg["out_root"].mkdir(parents=True, exist_ok=True)
     selection.to_csv(cfg["out_root"] / "selection_used.csv", index=False)
-    _write_json(cfg["out_root"] / "batch_config.json", {**cfg, "stages": list(stages)})   # explore.ipynb reads it
+    old = _read_json(cfg["out_root"] / "batch_config.json") or {}
+    ran = sorted(set(old.get("stages", [])) | set(phases), key=lambda p: PHASES.index(p) if p in PHASES else 99)
+    _write_json(cfg["out_root"] / "batch_config.json", {**cfg, "stages": ran})   # explore.ipynb reads it
     n = len(selection)
     total_h = selection.duration_s.astype(float).sum() / 3600
-    log(f"{n} videos, {total_h:.2f} h of video -> {cfg['out_root']}")
+    log(f"{n} videos, {total_h:.2f} h of video -> {cfg['out_root']}  (phases: {', '.join(phases)})")
 
     models = v2 = None
-    if "gpu" in stages or cfg["deep_gate"]:
+    if "gpu" in phases or ("cpu" in phases and cfg["deep_gate"]):
         import gpu_stages as gs
         v2 = gs.deep_update(gs.DEFAULT_CONFIG, cfg["v2"])
         models = gs.Models(v2)
         log(f"GPU stages: device {models.device}" + ("  (MOCK MODELS)" if models.mock else ""))
 
-    captioner = None
-    for phase in [p for p in ("cpu", "gpu", "vlm") if p in stages]:
+    for phase in phases:
         log(f"\n=== phase {phase.upper()} ===")
-        if phase == "vlm":
+        is_vlm = phase in VLM_PHASES
+        if is_vlm and captioner is None:
             import captions as cap
-            _free_gpu_models(models)
+            free_gpu_memory(models)
+            models = None
             captioner = cap.Captioner(cfg["vlm"])
-            log(f"VLM: {captioner.model_name}" + ("  (MOCK)" if captioner.cfg["mock"] else ""))
+        if is_vlm:
+            log(f"VLM: {captioner.model_name}" + ("  (MOCK)" if captioner.cfg["mock"] else "") +
+                f", captioning {VLM_PHASES[phase][0]}")
         t_phase = time.perf_counter()
         for i, (_, row) in enumerate(selection.iterrows(), 1):
             out = out_dir(cfg, row)
-            done = _read_json(out / f"summary_{phase}.json")
             tag = f"[{i}/{n}] {row['dataset']}/{row['video_id']}"
-            if phase == "vlm" and done and done.get("settings_hash") != captioner.settings_hash():
-                done = None   # other model / prompts / image size: caption again
-            if done and str(done.get(f"status_{phase}", "")).startswith(("ok", "no segments")) and not force:
-                log(f"{tag}: done before, skipped")
-                continue
+            if not is_vlm:
+                done = _read_json(out / f"summary_{phase}.json")
+                if done and str(done.get(f"status_{phase}", "")).startswith(("ok", "no segments")) and not force:
+                    log(f"{tag}: done before, skipped")
+                    continue
             t0 = time.perf_counter()
             try:
-                if phase == "vlm":
-                    s = run_vlm(row, cfg, captioner, force)
-                    msg = (f"{s['vlm_frames']} frame + {s['vlm_clips']} clip captions ({s['vlm_source']}), "
-                           f"{s['vlm_parse_failed']} unparsed")
+                if is_vlm:
+                    s = run_vlm(row, cfg, captioner, VLM_PHASES[phase], force)
+                    new = s["vlm_clips_new"] if phase == "vlm_clips" else s["vlm_frames_new"]
+                    have = s["vlm_clips"] if phase == "vlm_clips" else s["vlm_frames"]
+                    msg = (f"{have} {VLM_PHASES[phase][0]} captioned ({new} new, from {s['vlm_source']}), "
+                           f"{s['vlm_parse_failed']} unparsed" if new or have else "nothing to caption")
                 elif phase == "cpu":
                     s = run_cpu(row, cfg, models)
                     msg = (f"{s['duration_s'] / 60:.1f} min, {s['active_pct']:.0f}% active, {s['keyframes']} kf "
@@ -391,7 +463,8 @@ def run_batch(selection: pd.DataFrame, cfg: dict | None = None, stages=("cpu", "
                 log(f"{tag}: ERROR {e!r}  (details in {out / f'error_{phase}.json'})")
             collect_summary(cfg, selection)
         log(f"phase {phase.upper()} took {(time.perf_counter() - t_phase) / 60:.1f} min")
-        if phase == "vlm":
+        if is_vlm:
+            import captions as cap
             sheet = cap.make_review_sheet(cfg["out_root"], cfg.get("review_n", 60))
             if sheet:
                 log(f"caption hand-check sheet: {sheet} (+ caption_review.html)")
@@ -399,12 +472,14 @@ def run_batch(selection: pd.DataFrame, cfg: dict | None = None, stages=("cpu", "
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Run the pipeline on every video in selection.csv.")
+    ap = argparse.ArgumentParser(description="Run the pipeline on every video in selection.csv "
+                                             "(same as pipeline.ipynb, which is the main way to run it).")
     ap.add_argument("--selection", default=str(ROOT / "selection.csv"))
     ap.add_argument("--data-root", default=str(ds.DATA_ROOT))
-    ap.add_argument("--stages", nargs="+", default=["cpu", "gpu", "vlm"], choices=["cpu", "gpu", "vlm"])
+    ap.add_argument("--stages", nargs="+", default=["cpu", "gpu", "vlm"], choices=list(PHASES) + ["vlm"])
     ap.add_argument("--meva-min", type=float, default=60)
     ap.add_argument("--uca-min", type=float, default=60)
+    ap.add_argument("--fresh", action="store_true", help="delete all results in outputs/batch first")
     ap.add_argument("--force", action="store_true")
     ap.add_argument("--mock-models", action="store_true", help="fake GPU models + captioner: plumbing check only")
     ap.add_argument("--vlm-model", help="captioning model: HF name or local folder (default: captions.CAPTION_CONFIG)")
@@ -413,7 +488,10 @@ def main() -> None:
     cfg = {"v2": {"runtime": {"mock_models": True}}, "vlm": {"mock": True}} if a.mock_models else {"vlm": {}}
     if a.vlm_model:
         cfg["vlm"]["model"] = a.vlm_model
-    summ = run_batch(sel, cfg, stages=a.stages, force=a.force, log=lambda m: print(m, flush=True))
+    log = make_logger(DEFAULT_CFG["out_root"] / "run_log.txt")
+    if a.fresh:
+        clean_outputs(DEFAULT_CFG["out_root"], log=log)
+    summ = run_batch(sel, cfg, stages=a.stages, force=a.force, log=log)
     print(f"\nsummary: {DEFAULT_CFG['out_root'] / 'batch_summary.csv'} ({len(summ)} rows)")
 
 

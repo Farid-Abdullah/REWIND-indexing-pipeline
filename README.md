@@ -18,27 +18,29 @@ git clone -b moreVids https://github.com/Farid-Abdullah/cctv-motion-gating rewin
 cd rewind-batch
 ```
 
-Then in VS Code open `rewind-batch/pipeline.ipynb`, pick the kernel **rewind (5T)**, check the config cell, *Run All*.
-It prints one line per video. When it's done, open **`explore.ipynb`** and *Run All* to see the results.
+**Two notebooks, always in this order:**
 
-Or from a terminal inside `tmux` (keeps running if the laptop disconnects):
+1. **`pipeline.ipynb`** (kernel **rewind (5T)**): check the config cell (`VLM_MODEL`, `VLM_DEVICE`, `STAGES`), then
+   *Run All*. It checks the environment first (GPU, `sentencepiece`, YOLO, the Qwen folder) and stops before touching
+   anything if something is missing; then deletes the old results (`FRESH_RUN = True`) and runs every phase over every
+   video. No pictures, one line per video; everything also goes to `outputs/batch/run_log.txt`.
+2. **`explore.ipynb`**: *Run All* to see all the results: gating, keyframes, events, and the captions next to their
+   frames and the labelled moments.
 
-```bash
-tmux new -s batch            # later: tmux attach -t batch
-conda activate <the env behind "rewind (5T)">
-python datasets.py           # what's on disk: videos, hours, annotations (quick)
-python batch.py              # all three phases;  --stages cpu  = only stages 1-2;  --stages vlm = only captions
-```
+If the run stops part-way (VS Code disconnects, you interrupt it): set `FRESH_RUN = False` in `pipeline.ipynb` and
+*Run All* again; it continues where it stopped. The same functions also run from a terminal (`python batch.py --fresh`,
+see its docstring), but the notebooks are the main way.
 
 - **Which videos:** `selection.csv`, made on the first run: ~1 h of MEVA (whole 5-min time slots of all 4 cameras,
   annotated slots first) + ~1 h of UCA `dev_videos` (spread over categories, test split first). Edit it to change
   the set, or delete it to pick again. Data paths: `DATA_ROOT` in the config cell
   (`/mnt/5T_storage/clipsExtraction/datasets`).
-- **Three phases:** stages 1-2 (CPU) for every video first, then stages 3-4 (GPU), then stage 5 (captions, GPU).
-  If a GPU phase breaks or takes too long, interrupt it: earlier results are already saved and `explore.ipynb`
-  works with them.
-- **Resume:** finished videos are skipped on a re-run (`FORCE = True` redoes them). A failing video is logged and
-  skipped; its traceback is in `outputs/batch/<dataset>/<video>/error_cpu.json` (or `error_gpu.json`).
+- **Four phases, in order, each over every video:** `cpu` (stages 1-2), `gpu` (stages 3-4), `vlm_clips` (a caption
+  per clip), `vlm_frames` (a caption per selected frame; the slow one, hours). A later phase never costs earlier
+  results; `explore.ipynb` works with whatever has finished.
+- **Resume:** with `FRESH_RUN = False`, `cpu` / `gpu` skip finished videos and the caption phases continue at the
+  next clip / frame. A failing video is logged and skipped; its traceback is in
+  `outputs/batch/<dataset>/<video>/error_<phase>.json`.
 - **Ground truth** comes from the datasets themselves (`datasets.py`): MEVA activity labels (`*.activities.yml`,
   frame numbers / fps) and UCA sentences with timestamps. No hand-made CSV needed.
 
@@ -116,10 +118,13 @@ Qwen3-VL works too) writes a JSON description of:
   describe what *happens* (enters, picks up, leaves). A clip has a start and an end: it's what a search returns.
 
 It is told to describe only what it can see. Everything goes to `captions/captions.csv` (one row per frame or clip:
-camera, start/end, clock time, text, `search_text`, preview image). After the phase, `outputs/batch/caption_review.csv`
-+ `.html` show 60 random frames next to their captions, to count by hand how often it mentions things that
-aren't there. Needs `torch transformers accelerate` (Qwen3-VL: `transformers>=4.57`) and ~16 GB of GPU memory;
-the phase-2 models are freed first. Plumbing check without a GPU: `python captions.py --mock` or `"mock": True`.
+camera, start/end, clock time, text, `search_text`, preview image). Clips are captioned for every video first
+(phase `vlm_clips`, ~7 s per clip on one L4), then frames (phase `vlm_frames`, ~5-10 s per frame), so an
+interrupted run still leaves every video searchable by clip. The model is loaded once for both. After each caption
+phase, `outputs/batch/caption_review.csv` + `.html` show 60 random frames next to their captions, to count by hand
+how often it mentions things that aren't there (`explore.ipynb` section 6 turns the filled-in sheet into
+percentages). Model: `VLM_MODEL` in `pipeline.ipynb` (the VM's local Qwen2.5-VL-7B folder); needs `torch`,
+`transformers>=4.49` and ~17 GB free on `VLM_DEVICE`. Plumbing check without a GPU: `REWIND_MOCK=1`.
 
 Known weak spots (café video): track IDs switch in crowds, so one person can "appear" many times; `crowd` and
 `loitering` fire almost constantly in a busy lobby; X-CLIP rarely passes its threshold. The rules were written for
@@ -128,7 +133,8 @@ outdoor CCTV and need tuning per scene.
 ## Outputs (`outputs/batch/<dataset>/<video name>/`)
 
 Batch-level files in `outputs/batch/`: `batch_summary.csv` (one row per video, every number below), `selection_used.csv`,
-`batch_config.json`, `caption_review.csv` / `.html` (hand check of caption quality). Per video, `summary_cpu.json` / `summary_gpu.json` hold that video's row, and `gt.csv` the
+`batch_config.json`, `run_log.txt` (everything the run printed, with times), `caption_review.csv` / `.html` (hand
+check of caption quality). Per video, `summary_cpu.json` / `summary_gpu.json` hold that video's row, and `gt.csv` the
 labelled items with a `has_keyframe` column.
 
 

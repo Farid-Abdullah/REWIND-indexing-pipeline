@@ -21,15 +21,18 @@ well-chosen frames to expensive models (captioning, indexing) instead of every f
 ## Commands
 
 ```bash
+# main way: pipeline.ipynb (config cell, Run All: pre-flight check, fresh start, phases cpu -> gpu -> vlm_clips ->
+# vlm_frames), then explore.ipynb (Run All) to look at the results. The user prefers notebooks over terminal commands.
 python datasets.py          # list MEVA / UCA videos, hours and annotations under DATA_ROOT
-python batch.py             # every stage on every video in selection.csv -> outputs/batch/ (= pipeline.ipynb)
-python batch.py --stages vlm   # only stage 5 captions (needs phase 1; uses phase 2's frames if present)
+python batch.py --fresh     # same as pipeline.ipynb from a terminal -> outputs/batch/
 python captions.py --mock      # stage 5 on every video folder with a fake captioner (plumbing check)
 python motion_gating.py v.mp4 && python keyframes.py v.mp4   # stages 1-2 on one video
 # notebooks: pipeline.ipynb runs the batch (no pictures), explore.ipynb shows the results; kernel "rewind (5T)" on the VM
 ```
 
 There are no tests. Check a change by re-running the batch and comparing `outputs/batch/batch_summary.csv`.
+Notebook plumbing check off the VM: `REWIND_DATA_ROOT=… REWIND_OUT_ROOT=… REWIND_SELECTION=… REWIND_MOCK=1 jupyter
+nbconvert --to notebook --execute pipeline.ipynb --output-dir /tmp`, then the same for `explore.ipynb`.
 For a plumbing check without the VM's data, `REWIND_DATA_ROOT`, `REWIND_OUT_ROOT`, `REWIND_SELECTION` and
 `REWIND_MOCK=1` point the notebooks at a fake dataset tree and fake GPU models. The old baseline on
 `meva_30min.mp4` was 109 keyframes instead of 1,801 at 1 fps (16.5x fewer), measured *before* `q_noise=0.5` and
@@ -40,9 +43,9 @@ For a plumbing check without the VM's data, `REWIND_DATA_ROOT`, `REWIND_OUT_ROOT
 
 | Path | Role |
 |---|---|
-| `pipeline.ipynb` | Runs the batch (`batch.run_batch`) over `selection.csv`; prints only. Committed **without** outputs |
-| `explore.ipynb` | Reads `outputs/batch/` and shows everything (overview, per video, MEVA multi-camera, GT misses). Committed **without** outputs |
-| `batch.py` | Two-phase batch (CPU stages for all videos, then GPU stages), resume, per-video error files, `batch_summary.csv` |
+| `pipeline.ipynb` | The run: pre-flight check (GPU via torch, `sentencepiece`, `ultralytics`, VLM folder), `FRESH_RUN` (`batch.clean_outputs`), then one cell per phase via `batch.run_batch`; logs to `outputs/batch/run_log.txt`; prints only. Committed **without** outputs |
+| `explore.ipynb` | Reads `outputs/batch/` and shows everything (overview, per video, MEVA multi-camera, GT misses, events, captions next to their frames and labels, caption speed / hand check, run times). Committed **without** outputs |
+| `batch.py` | Phases `cpu`, `gpu`, `vlm_clips`, `vlm_frames` (`"vlm"` = both), each over all videos; cpu/gpu skip finished videos, caption phases resume per item; `clean_outputs`, `make_logger`, per-video `error_<phase>.json`, `batch_summary.csv` |
 | `datasets.py` | MEVA / UCA discovery, ~1 h selection per dataset, ground truth (MEVA `*.activities.yml` frames / fps; UCA sentences) |
 | `motion_gating.py` | Stage 1: frame diff + MOG2 (colour, NCC lighting filter), adaptive threshold on the quieter half, hysteresis segments, fused gate (`add_fused`); ground-truth checks (`gate_table`, `keyframe_hits`, `gate_agreement`) |
 | `keyframes.py` | Stage 2: first / peak / change (4x4 tile pHash) / maxgap keyframes, dedup, idle heartbeat |
@@ -68,7 +71,7 @@ vote, ground-truth evaluation.
   `siglip-base-patch16-224`), one record per keyframe of the primary sampler (`kcenter`, falls back to `phash`).
 - A model that fails to load is skipped with a warning (`models.failed`). SigLIP needs `sentencepiece`.
 - Stage 5 (`captions.py`) reads that hand-off (or stage 2's `keyframes.csv`) and writes `captions/captions.csv`.
-  Unlike `Models`, a VLM that fails to load is an error per video (`error_vlm.json`), not a silent skip. The
+  Unlike `Models`, a VLM that fails to load is an error per video (`error_vlm_<level>.json`), not a silent skip. The
   detector's events are stored next to captions but deliberately not put in the prompt (independent check).
 - Known weak spots (café video): track IDs switch in crowds, `crowd`/`loitering` fire constantly in busy scenes,
   X-CLIP's softmax over 13 prompts rarely passes `xclip_threshold` 0.35, the deep gate's first frames become its

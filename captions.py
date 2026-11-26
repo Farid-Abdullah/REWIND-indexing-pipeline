@@ -415,12 +415,15 @@ def _append(path: Path, records: list[dict]) -> None:
             f.write(json.dumps(r, default=str) + "\n")
 
 
-def caption_video(vdir: str | Path, captioner: Captioner, force: bool = False) -> dict:
+def caption_video(vdir: str | Path, captioner: Captioner, force: bool = False,
+                  levels: list[str] | None = None) -> dict:
     """Caption one video folder of the batch (needs summary_cpu.json, segments.csv, keyframes.csv).
-    Writes captions/frame_captions.jsonl, clip_captions.jsonl, captions.csv, frames/*.jpg and
-    summary_vlm.json. Returns the summary dict."""
+    `levels` (default: the captioner's) = which of "clips" / "frames" to caption now; the other level's
+    finished records are kept. Writes captions/frame_captions.jsonl, clip_captions.jsonl, captions.csv
+    (both levels, everything captioned so far), frames/*.jpg and summary_vlm.json. Returns the summary."""
     vdir = Path(vdir)
     c = captioner.cfg
+    levels = list(levels or c["levels"])
     s1 = _read_json(vdir / "summary_cpu.json") or {}
     if s1.get("status_cpu") != "ok":
         raise RuntimeError(f"{vdir}: stage 1-2 results missing (summary_cpu.json); run the CPU phase first")
@@ -440,7 +443,7 @@ def caption_video(vdir: str | Path, captioner: Captioner, force: bool = False) -
     h = captioner.settings_hash()
     frames, source = load_frames_to_caption(vdir, c["source"])
     segments = pd.read_csv(vdir / "segments.csv")
-    clips = make_clips(segments, c["clip_max_s"]) if "clips" in c["levels"] else make_clips(segments.iloc[0:0], 1)
+    clips = make_clips(segments, c["clip_max_s"]) if "clips" in levels else make_clips(segments.iloc[0:0], 1)
     kf_jpgs = {}
     if (vdir / "keyframes.csv").exists():
         kf = pd.read_csv(vdir / "keyframes.csv")
@@ -449,13 +452,15 @@ def caption_video(vdir: str | Path, captioner: Captioner, force: bool = False) -
     clip_idx = {r.clip_id: clip_frame_indices(r, frames, fps, n_frames, c["clip_max_frames"], c["clip_min_frames"])
                 for r in clips.itertuples()}
 
+    prev = _read_json(vdir / "summary_vlm.json") or {}
+    if prev.get("settings_hash") != h:
+        prev = {}   # other settings: earlier speed numbers don't apply
     s = {"status_vlm": "ok", "vlm_model": captioner.model_name, "vlm_source": source, "settings_hash": h,
-         "vlm_frames": 0, "vlm_clips": 0, "vlm_frames_new": 0, "vlm_clips_new": 0, "vlm_parse_failed": 0,
-         "vlm_unreadable_frames": 0}
+         "vlm_frames_new": 0, "vlm_clips_new": 0}
     T = {"vlm_decode_s": 0.0, "vlm_frames_s": 0.0, "vlm_clips_s": 0.0}
 
-    # --- decode every frame either level needs, once
-    need = set(int(i) for i in frames.frame_idx) if "frames" in c["levels"] else set()
+    # --- decode every frame the requested levels need, once
+    need = set(int(i) for i in frames.frame_idx) if "frames" in levels else set()
     for v in clip_idx.values():
         need |= set(v)
     t0 = time.perf_counter()
@@ -463,9 +468,9 @@ def caption_video(vdir: str | Path, captioner: Captioner, force: bool = False) -
     T["vlm_decode_s"] = time.perf_counter() - t0
     s["vlm_unreadable_frames"] = len(bad)
 
-    # --- level 1: frames
+    # --- level: frames
     fpath = cap_dir / "frame_captions.jsonl"
-    if "frames" in c["levels"]:
+    if "frames" in levels:
         done = {} if force else _load_done(fpath, "frame_idx", h)
         todo = [r for r in frames.itertuples() if int(r.frame_idx) not in done and int(r.frame_idx) not in bad]
         _rewrite(fpath, [done[k] for k in sorted(done)])
@@ -500,12 +505,13 @@ def caption_video(vdir: str | Path, captioner: Captioner, force: bool = False) -
                 log(f"{base['video_id']}: frames {min(i + bs, len(todo))}/{len(todo)} ({dt:.1f} s/frame)")
         T["vlm_frames_s"] = time.perf_counter() - t0
         frame_recs = [done[k] for k in sorted(done)]
-    else:
-        frame_recs = []
+    else:   # not requested now: keep what an earlier run captioned
+        done = _load_done(fpath, "frame_idx", h)
+        frame_recs = [done[k] for k in sorted(done)]
 
-    # --- level 2: clips
+    # --- level: clips
     cpath = cap_dir / "clip_captions.jsonl"
-    if "clips" in c["levels"]:
+    if "clips" in levels:
         done = {} if force else _load_done(cpath, "clip_id", h)
         _rewrite(cpath, [done[k] for k in sorted(done)])
         t0 = time.perf_counter()
@@ -538,24 +544,38 @@ def caption_video(vdir: str | Path, captioner: Captioner, force: bool = False) -
                 log(f"{base['video_id']}: clips {j + 1}/{len(todo)} ({rec['gen_s']:.1f} s/clip)")
         T["vlm_clips_s"] = time.perf_counter() - t0
         clip_recs = [done[k] for k in sorted(done)]
-    else:
-        clip_recs = []
+    else:   # not requested now: keep what an earlier run captioned
+        done = _load_done(cpath, "clip_id", h)
+        clip_recs = [done[k] for k in sorted(done)]
 
-    # --- one flat table: what a search or the dashboard reads
+    # --- one flat table with everything captioned so far: what a search or the dashboard reads
     write_captions_csv(cap_dir / "captions.csv", frame_recs, clip_recs)
-    D = float(s1.get("duration_s") or 0)
-    s.update(T)
-    s["vlm_frames"], s["vlm_clips"] = len(frame_recs), len(clip_recs)
-    s["vlm_parse_failed"] = sum(not r["parse_ok"] for r in frame_recs + clip_recs)
-    s["vlm_s"] = sum(T.values())
-    new_f, new_c = s["vlm_frames_new"], s["vlm_clips_new"]
-    s["vlm_s_per_frame"] = T["vlm_frames_s"] / new_f if new_f else None
-    s["vlm_s_per_clip"] = T["vlm_clips_s"] / new_c if new_c else None
-    if new_f == len(frame_recs) and new_c == len(clip_recs) and D > 0:   # only meaningful for a full run
-        s["vlm_min_per_video_hour"] = s["vlm_s"] / 60 / (D / 3600)
-    s["vlm_peak_vram_gb"] = captioner._vl.peak_vram_gb() if captioner._vl is not None else None
+    s.update(summarise_vlm(prev, s, T, frame_recs, clip_recs, len(frames), len(clip_idx) if "clips" in levels
+                           else prev.get("vlm_clips_total", len(clip_recs)), float(s1.get("duration_s") or 0)))
+    s["vlm_levels_run"] = levels
+    s["vlm_peak_vram_gb"] = captioner._vl.peak_vram_gb() if captioner._vl is not None else prev.get("vlm_peak_vram_gb")
     (vdir / "summary_vlm.json").write_text(json.dumps(s, indent=1, default=str))
     return s
+
+
+def summarise_vlm(prev: dict, s: dict, T: dict, frame_recs, clip_recs, n_frames_total, n_clips_total, D) -> dict:
+    """Counts, and speeds that survive resumes: seconds per frame / clip are measured on the items captioned
+    in this run (or kept from an earlier run with the same settings), and the cost of a full video is
+    estimated from them, so an interrupted-and-resumed video still gets an honest minutes-per-hour figure."""
+    out = {"vlm_frames": len(frame_recs), "vlm_clips": len(clip_recs),
+           "vlm_frames_total": n_frames_total, "vlm_clips_total": n_clips_total,
+           "vlm_parse_failed": sum(not r["parse_ok"] for r in frame_recs + clip_recs)}
+    for unit, n_new in (("frame", s["vlm_frames_new"]), ("clip", s["vlm_clips_new"])):
+        key, t = f"vlm_s_per_{unit}", T[f"vlm_{unit}s_s"]
+        out[key] = t / n_new if n_new else prev.get(key)
+        out[f"vlm_{unit}s_s"] = t if n_new else prev.get(f"vlm_{unit}s_s", 0.0)   # time of the last run that captioned
+    out["vlm_decode_s"] = T["vlm_decode_s"] + (prev.get("vlm_decode_s") or 0.0)
+    out["vlm_s"] = (out["vlm_frames_s"] or 0.0) + (out["vlm_clips_s"] or 0.0) + out["vlm_decode_s"]
+    est = (n_frames_total * (out["vlm_s_per_frame"] or 0.0) if out["vlm_frames"] else 0.0) + \
+          (n_clips_total * (out["vlm_s_per_clip"] or 0.0) if out["vlm_clips"] else 0.0)
+    out["vlm_min_per_video_hour"] = est / 60 / (D / 3600) if D > 0 and est > 0 else None
+    out["vlm_complete"] = out["vlm_frames"] >= n_frames_total and out["vlm_clips"] >= n_clips_total
+    return out
 
 
 def write_captions_csv(path: Path, frame_recs: list[dict], clip_recs: list[dict]) -> pd.DataFrame:

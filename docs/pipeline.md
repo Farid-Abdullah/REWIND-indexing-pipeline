@@ -41,11 +41,11 @@ video (25-30 frames/s)
 | Part | Code | Origin |
 |---|---|---|
 | Dataset discovery, selection, labels | `datasets.py` | added for the batch run |
-| Batch loop (two phases, resume, per-video errors) | `batch.py`, `pipeline.ipynb` | added for the batch run |
+| Batch loop (phases cpu → gpu → vlm_clips → vlm_frames, pre-flight check, fresh start, resume, per-video errors) | `batch.py`, `pipeline.ipynb` | added for the batch run |
 | Stage 1 | `motion_gating.py` (+ `gpu_stages.scan_deep` for the deep gate) | v1 (Farid), with v2's threshold, colour MOG2 and fused vote |
 | Stage 2 | `keyframes.py` | v1 |
 | Stages 3, 4 | `gpu_stages.py` | v2 (Muzayyan, written with an LLM) |
-| Stage 5 (captions) | `captions.py`, phase `vlm` of `batch.py` | added 26 Nov 2026 (written with an LLM) |
+| Stage 5 (captions) | `captions.py`, phases `vlm_clips` / `vlm_frames` | added 26 Nov 2026 (written with an LLM) |
 | Results views | `explore.ipynb` | added for the batch run |
 
 The batch runs stages 1-2 (and the ground-truth check) for **every video first**, then stages 3-4 for every
@@ -312,9 +312,10 @@ hallucinated and missed items) and `captions.review_summary()` for the percentag
 `frames/*.jpg` (the frames at the size the model saw). Per video `summary_vlm.json`: counts, unparsed answers,
 seconds per frame / clip, minutes per video-hour, peak VRAM.
 
-**Cost estimate, to be measured.** The 19 Nov hand-off had 1,075 frames for 2 h of video, plus about one clip
-per segment-minute. At an assumed 1-3 s per frame on an L4 that is roughly 20-55 GPU-minutes for 2 h, which would
-make captioning the most expensive stage, as expected. Replace this paragraph with the measured numbers.
+**Cost, first measurement (26 Nov, one L4, batch 4, not yet a full run).** ~7 s per clip and 5-10 s per frame.
+The 19 Nov hand-off had ~1,075 frames for 2 h of video: captioning every frame would take 1.5-3 GPU-hours, slower
+than real time, while clips (about one per segment-minute) take a fraction of that. That is why clips run first
+and frames are optional. Replace with the numbers of a full run (`explore.ipynb` section 6).
 
 ### Check yourself (stage 5)
 1. Why are the detector's events not put into the prompt, even though they would make captions "better"?
@@ -427,8 +428,8 @@ Long activities are caught, short ones are not: `person_talks_to_person` 86 % (1
    phase: embeddings, `kcenter`, SigLIP tags.
 2. G421 15:55: the motion score is exactly 0 for the last ~50 s while labelled activity continues. Frozen frames
    or a decoding problem? Open the video and check.
-2b. Run stage 5 on the VM (`STAGES=["vlm"]`): confirm the model loads, fill in the cost estimate in section 4b,
-   and hand-check `caption_review.csv`.
+2b. Run stage 5 on the VM (`pipeline.ipynb`, phases `vlm_clips`, `vlm_frames`): fill in the cost estimate in
+   section 4b (first attempt: ~7 s per clip, 5-10 s per frame on one L4) and hand-check `caption_review.csv`.
 
 **To decide with experiments** (settings and expected effects: `docs/explanation.md`, "Suggested experiments")
 3. Gate: switch to `diff` or `fused`?
