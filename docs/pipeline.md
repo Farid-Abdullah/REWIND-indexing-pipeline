@@ -326,6 +326,39 @@ and frames are optional. Replace with the numbers of a full run (`explore.ipynb`
 
 ---
 
+## 4c. Search (`search.py`, `search.ipynb`) — code added 26 Nov, not run on the VM yet
+
+**Goal:** a typed sentence returns ranked moments (video, camera, start-end, best frame), and a fair score for it.
+Everything is kept in memory (≈ 2 h of video = a few thousand vectors), so no vector database or server is needed
+yet; the same vectors move to one later.
+
+| Method | Query side | Index side | Returns |
+|---|---|---|---|
+| `captions` | `bge-small-en-v1.5` (BGE, Xiao et al. 2023) with its retrieval prefix | the clip caption's summary, actions, people, vehicles, objects, notable | clips |
+| `siglip_selected` | SigLIP text tower | stage 4's SigLIP frame embeddings (768-d); one result per 10 s per video | frames → their clip |
+| `hybrid` | both | reciprocal rank fusion [Cormack et al. 2009], score = Σ 1/(60 + rank); a clip's SigLIP score = its best frame | clips |
+| `siglip_1fps`, `clip_1fps` | SigLIP / CLIP ViT-B/32 text | 1 frame/s of every **whole** video (no gating, no captions) | frames |
+
+The two baselines are what the supervisor asked for ("CLIP-only and SigLIP-only"): they see every second of video,
+so they show what gating + captions add or lose.
+
+**Spans.** A result has its clip (≤ 60 s) and a 10-s window (`moment_s`) around its best frame (the best SigLIP
+frame inside the clip). A 5-s event inside a 60-s clip has IoU 0.08, so IoU scores use the window; the lenient score
+uses the clip.
+
+**Queries.** UCA: every sentence of the selected videos, answer = its own span (a few hundred queries). MEVA: one
+operator-style sentence per activity type (`search.MEVA_QUERIES`, e.g. *"a person gets out of a car"*), answers =
+every labelled instance on any camera, so a hit on any one counts. Plus 20 free-text operator queries without
+ground truth for the demo (objective 5).
+
+**Metrics.** Recall@1/5/10 at temporal IoU 0.3 / 0.5, lenient Recall@K (any overlap), MRR at IoU 0.3, per dataset ×
+method × setting (`corpus`: all videos of the dataset; `video`: only the query's video, UCA's grounding setting).
+**reachable %** = queries whose answer overlaps some clip: the ceiling for the gated methods (the gating ceiling,
+§6: MEVA 64 %, UCA 76 % of labelled items covered by a segment), and lenient R@5 over reachable queries only separates
+gating misses from search misses. Latency = encode + rank one query, median and p95.
+
+---
+
 ## 5. Evaluation and data
 
 ### 5.1 What the code measures (`motion_gating.gate_table`, `keyframe_hits`; `batch.run_cpu`)
@@ -355,13 +388,13 @@ For every video with labels, for every gate and keyframe set:
 - **UCF-Crime is partly not CCTV** (news and YouTube compilations with cuts, replays, several angles). A cut looks
   like whole-frame motion. **MEVA is the honest test for gating; UCA is the benchmark for retrieval.**
 
-### 5.3 What the supervisor asked for (not built yet)
+### 5.3 What the supervisor asked for
 
-Retrieval Recall@1/5/10 at temporal IoU 0.3 and 0.5 on UCA test queries, against CLIP-only and SigLIP-only
-baselines; 50-100 of our own queries on MEVA and our footage; query latency and hours indexed per GPU-hour; how
-often the captioner mentions things that aren't there. Captions and the hand-check sheet for the last one exist
-now (section 4b); still missing: embeddings (SigLIP), a text encoder over `search_text`, and the search itself;
-the database and API come after.
+Retrieval Recall@1/5/10 at temporal IoU 0.3 and 0.5 on UCA queries, against CLIP-only and SigLIP-only baselines
+(section 4c, `search.ipynb`; on UCA **val** videos, test kept for final numbers); our own queries on MEVA (one per
+activity type + 20 free-text); query latency (4c) and hours indexed per GPU-hour (`explore.ipynb` section 7); how
+often the captioner mentions things that aren't there (section 4b, hand check). Still missing: the database, the
+API, the dashboard, and an LLM layer that rewrites queries (time and camera filters exist in `search()`).
 
 ---
 

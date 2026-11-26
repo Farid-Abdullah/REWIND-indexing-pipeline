@@ -502,6 +502,29 @@ the hallucination and miss rate).
 
 ---
 
+## Search (`search.py`, run by `search.ipynb`)
+
+Builds an in-memory index from the clip captions and stage 4's SigLIP embeddings, makes the test queries from the
+ground truth (`outputs/batch/search/queries.csv`; edit it to add your own), runs every query through every method,
+and writes the scores to `outputs/batch/search/`. `explore.ipynb` section 8 shows them. Settings
+(`search.SEARCH_CONFIG`, overridden by `CFG` in the notebook):
+
+| Setting | Default | Raise it → | Lower it → |
+|---|---|---|---|
+| `moment_s` | 10 s | longer returned moments: IoU better for long events, worse for short ones | tighter moments: needs the best frame to be exactly right |
+| `rrf_k` | 60 | the two rankings in `hybrid` count more equally, top ranks matter less | the top of each ranking dominates |
+| `nms_s` | 10 s | frame methods return more different moments | more results from one busy moment |
+| `top_k` | 10 | more results stored per query (R@10 needs ≥ 10) | smaller `results.csv` |
+| `baselines` | True | | False skips the 1 frame/s SigLIP + CLIP pass (minutes; cached in `search/index/`) |
+| `text_model` | `BAAI/bge-small-en-v1.5` | (bge-base / -large: better text match, slower) | TF-IDF fallback if it can't load |
+| `siglip_model` | `google/siglip-base-patch16-224` | must be the model stage 3 used, or the query and frame vectors don't match (checked) | |
+
+**What to look at:** reachable % first (the gating ceiling), then lenient R@5 (does the operator land in the right
+clip?), then R@5 IoU 0.3 (is the moment exact?); `hybrid` vs the two 1 frame/s baselines tells whether the pipeline
+helps; "where are the misses" splits failures into gating and search.
+
+---
+
 ## Outputs (per video: `outputs/batch/<dataset>/<video>/`)
 
 | File | From | Contents |

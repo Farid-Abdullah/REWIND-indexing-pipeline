@@ -210,14 +210,31 @@ class TextEmbedder:
             return np.concatenate(out)
         return self._tfidf(texts)
 
+    def fit(self, texts: list[str]) -> "TextEmbedder":
+        """TF-IDF fallback only: fix the vocabulary and IDF on these texts (e.g. the captions), so later
+        encode() calls (e.g. queries) land in the same space. No effect with a sentence model."""
+        if self.kind == "tfidf":
+            tokens = [re.findall(r"[a-z]+", t.lower()) for t in texts]
+            self.vocab = {w: i for i, w in enumerate(sorted({w for ts in tokens for w in ts}))}
+            df = np.zeros(max(1, len(self.vocab)), np.float32)
+            for ts in tokens:
+                for w in set(ts):
+                    df[self.vocab[w]] += 1
+            self.idf = np.log((1 + len(texts)) / (1 + df)) + 1
+        return self
+
     def _tfidf(self, texts):
         tokens = [re.findall(r"[a-z]+", t.lower()) for t in texts]
-        vocab = {w: i for i, w in enumerate(sorted({w for ts in tokens for w in ts}))}
+        vocab, idf = getattr(self, "vocab", None), getattr(self, "idf", None)
+        if vocab is None:   # not fitted: vocabulary from these texts (only comparable within this call)
+            vocab = {w: i for i, w in enumerate(sorted({w for ts in tokens for w in ts}))}
         M = np.zeros((len(texts), max(1, len(vocab))), np.float32)
         for i, ts in enumerate(tokens):
             for w in ts:
-                M[i, vocab[w]] += 1
-        idf = np.log((1 + len(texts)) / (1 + (M > 0).sum(0))) + 1
+                if w in vocab:
+                    M[i, vocab[w]] += 1
+        if idf is None:
+            idf = np.log((1 + len(texts)) / (1 + (M > 0).sum(0))) + 1
         M *= idf
         return M / np.maximum(np.linalg.norm(M, axis=1, keepdims=True), 1e-9)
 

@@ -1,4 +1,4 @@
-# REWIND ingest: motion gating, keyframes, events, captions
+# REWIND: motion gating, keyframes, events, captions, search
 
 **Goal:** in a long video from a fixed camera, find *when something happens* and pick *a few frames that show it*.
 Expensive models (captioning, the search index) then only look at those frames instead of every frame.
@@ -18,14 +18,17 @@ git clone -b moreVids https://github.com/Farid-Abdullah/cctv-motion-gating rewin
 cd rewind-batch
 ```
 
-**Two notebooks, always in this order:**
+**Three notebooks, always in this order:**
 
 1. **`pipeline.ipynb`** (kernel **rewind (5T)**): check the config cell (`VLM_MODEL`, `VLM_DEVICE`, `STAGES`), then
    *Run All*. It checks the environment first (GPU, `sentencepiece`, YOLO, the Qwen folder) and stops before touching
    anything if something is missing; then deletes the old results (`FRESH_RUN = True`) and runs every phase over every
    video. No pictures, one line per video; everything also goes to `outputs/batch/run_log.txt`.
-2. **`explore.ipynb`**: *Run All* to see all the results: gating, keyframes, events, and the captions next to their
-   frames and the labelled moments.
+2. **`search.ipynb`**: *Run All*. Builds the search index from the captions and SigLIP embeddings, makes the test
+   queries from the ground truth, runs them through every search method and the two baselines, scores them, saves
+   `outputs/batch/search/`. Ends with a *try a query* cell. A few minutes.
+3. **`explore.ipynb`**: *Run All* to see all the results: gating, keyframes, events, the captions next to their
+   frames and the labelled moments, and (section 8) the search scores and example results with their frames.
 
 If the run stops part-way (VS Code disconnects, you interrupt it): set `FRESH_RUN = False` in `pipeline.ipynb` and
 *Run All* again; it continues where it stopped. The same functions also run from a terminal (`python batch.py --fresh`,
@@ -134,6 +137,36 @@ interrupted run still leaves every video searchable by clip. The model is loaded
 runs one copy of the model per L4, each on about half the video-time, so captioning takes about half as long;
 `"cuda:0"` uses one GPU. Plumbing check without a GPU: `REWIND_MOCK=1`.
 
+## Search (`search.py`, `search.ipynb`)
+
+Type a sentence, get ranked moments (video, camera, start-end, best frame). Everything is in memory: no database,
+no server. Methods, all scored the same way:
+
+| Method | The query is compared with | Returns |
+|---|---|---|
+| `captions` | each clip's caption (`bge-small` sentence embeddings, with bge's retrieval prefix on the query) | clips |
+| `siglip_selected` | the SigLIP embeddings of stage 4's selected frames (SigLIP's text tower; one result per 10 s) | frames, mapped to their clip |
+| `hybrid` (default) | both, merged by reciprocal rank fusion (`rrf_k = 60`); a clip's SigLIP score = its best frame | clips |
+| `siglip_1fps` | baseline: SigLIP on 1 frame/s of every whole video (no gating, no captions) | frames |
+| `clip_1fps` | baseline: the same with CLIP ViT-B/32 | frames |
+
+Each result has two spans: the **clip** (up to 60 s) and a **window** of `moment_s` = 10 s around its best frame,
+because a 60-s clip can never reach IoU 0.3 with a 5-s event.
+
+**Test queries** (`outputs/batch/search/queries.csv`, written from the ground truth on the first run; edit it or add
+rows): every UCA sentence of the selected UCA videos (answer: its own span) and one operator-style sentence per MEVA
+activity type, e.g. `person_opens_vehicle_door` → *"a person opens a car door"* (answers: every labelled instance on
+any camera; the mapping is `search.MEVA_QUERIES`). Plus 20 free-text operator queries without ground truth, judged by eye.
+
+**Scores** (`metrics.csv`) per dataset, method and setting (`corpus` = all videos of the dataset, `video` = only the
+query's own video, UCA only): Recall@1/5/10 at temporal IoU 0.3 and 0.5 (window span), lenient Recall@K (the clip
+overlaps an answer), MRR, **reachable %** (an answer overlaps some clip: the most the gated methods can reach) and
+lenient R@5 over reachable queries only (is the search itself good?), plus ms per query.
+
+Outputs in `outputs/batch/search/`: `queries.csv`, `results.csv` (top 10 per query x method x setting),
+`per_query.csv` (first correct rank per query), `metrics.csv`, `latency.csv`, `demo_results.csv`, `search_run.json`,
+and `index/` (the cached baseline embeddings; delete it to re-embed). Plumbing check without models: `REWIND_MOCK=1`.
+
 Known weak spots (café video): track IDs switch in crowds, so one person can "appear" many times; `crowd` and
 `loitering` fire almost constantly in a busy lobby; X-CLIP rarely passes its threshold. The rules were written for
 outdoor CCTV and need tuning per scene.
@@ -142,7 +175,7 @@ outdoor CCTV and need tuning per scene.
 
 Batch-level files in `outputs/batch/`: `batch_summary.csv` (one row per video, every number below), `selection_used.csv`,
 `batch_config.json`, `run_log.txt` (everything the run printed, with times), `clip_review/` (hand-check sheets,
-made by `explore.ipynb`). Per video, `summary_cpu.json` / `summary_gpu.json` hold that video's row, and `gt.csv` the
+made by `explore.ipynb`), `search/` (search scores, see above). Per video, `summary_cpu.json` / `summary_gpu.json` hold that video's row, and `gt.csv` the
 labelled items with a `has_keyframe` column.
 
 
